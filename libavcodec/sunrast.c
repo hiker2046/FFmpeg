@@ -26,27 +26,12 @@
 #include "internal.h"
 #include "sunrast.h"
 
-typedef struct SUNRASTContext {
-    AVFrame picture;
-} SUNRASTContext;
-
-static av_cold int sunrast_init(AVCodecContext *avctx) {
-    SUNRASTContext *s = avctx->priv_data;
-
-    avcodec_get_frame_defaults(&s->picture);
-    avctx->coded_frame = &s->picture;
-
-    return 0;
-}
-
 static int sunrast_decode_frame(AVCodecContext *avctx, void *data,
                                 int *got_frame, AVPacket *avpkt)
 {
     const uint8_t *buf       = avpkt->data;
     const uint8_t *buf_end   = avpkt->data + avpkt->size;
-    SUNRASTContext * const s = avctx->priv_data;
-    AVFrame *picture         = data;
-    AVFrame * const p        = &s->picture;
+    AVFrame * const p        = data;
     unsigned int w, h, depth, type, maptype, maplength, stride, x, y, len, alen;
     uint8_t *ptr, *ptr2 = NULL;
     const uint8_t *bufstart = buf;
@@ -69,19 +54,15 @@ static int sunrast_decode_frame(AVCodecContext *avctx, void *data,
     buf      += 32;
 
     if (type == RT_EXPERIMENTAL) {
-        av_log_ask_for_sample(avctx, "unsupported (compression) type\n");
+        avpriv_request_sample(avctx, "TIFF/IFF/EXPERIMENTAL (compression) type");
         return AVERROR_PATCHWELCOME;
     }
     if (type > RT_FORMAT_IFF) {
         av_log(avctx, AV_LOG_ERROR, "invalid (compression) type\n");
         return AVERROR_INVALIDDATA;
     }
-    if (av_image_check_size(w, h, 0, avctx)) {
-        av_log(avctx, AV_LOG_ERROR, "invalid image size\n");
-        return AVERROR_INVALIDDATA;
-    }
     if (maptype == RMT_RAW) {
-        av_log_ask_for_sample(avctx, "unsupported colormap type\n");
+        avpriv_request_sample(avctx, "Unknown colormap type");
         return AVERROR_PATCHWELCOME;
     }
     if (maptype > RMT_RAW) {
@@ -91,7 +72,7 @@ static int sunrast_decode_frame(AVCodecContext *avctx, void *data,
 
     if (type == RT_FORMAT_TIFF || type == RT_FORMAT_IFF) {
         av_log(avctx, AV_LOG_ERROR, "unsupported (compression) type\n");
-        return -1;
+        return AVERROR_PATCHWELCOME;
     }
 
     switch (depth) {
@@ -115,20 +96,21 @@ static int sunrast_decode_frame(AVCodecContext *avctx, void *data,
             return AVERROR_INVALIDDATA;
     }
 
-    if (p->data[0])
-        avctx->release_buffer(avctx, p);
-
-    if (w != avctx->width || h != avctx->height)
-        avcodec_set_dimensions(avctx, w, h);
-    if ((ret = ff_get_buffer(avctx, p)) < 0) {
-        av_log(avctx, AV_LOG_ERROR, "get_buffer() failed\n");
+    ret = ff_set_dimensions(avctx, w, h);
+    if (ret < 0)
         return ret;
-    }
+
+    /* scanlines are aligned on 16 bit boundaries */
+    len  = (depth * w + 7) >> 3;
+    alen = len + (len & 1);
+
+    if (buf_end - buf < maplength + (len * h) * 3 / 256)
+        return AVERROR_INVALIDDATA;
+
+    if ((ret = ff_get_buffer(avctx, p, 0)) < 0)
+        return ret;
 
     p->pict_type = AV_PICTURE_TYPE_I;
-
-    if (buf_end - buf < maplength)
-        return AVERROR_INVALIDDATA;
 
     if (depth > 8 && maplength) {
         av_log(avctx, AV_LOG_WARNING, "useless colormap found or file is corrupted, trying to recover\n");
@@ -149,18 +131,14 @@ static int sunrast_decode_frame(AVCodecContext *avctx, void *data,
     buf += maplength;
 
     if (maplength && depth < 8) {
-        ptr = ptr2 = av_malloc((w + 15) * h);
+        ptr = ptr2 = av_malloc_array((w + 15), h);
         if (!ptr)
             return AVERROR(ENOMEM);
         stride = (w + 15 >> 3) * depth;
     } else {
-    ptr    = p->data[0];
-    stride = p->linesize[0];
+        ptr    = p->data[0];
+        stride = p->linesize[0];
     }
-
-    /* scanlines are aligned on 16 bit boundaries */
-    len  = (depth * w + 7) >> 3;
-    alen = len + (len & 1);
 
     if (type == RT_BYTE_ENCODED) {
         int value, run;
@@ -190,7 +168,7 @@ static int sunrast_decode_frame(AVCodecContext *avctx, void *data,
         }
     } else {
         for (y = 0; y < h; y++) {
-            if (buf_end - buf < len)
+            if (buf_end - buf < alen)
                 break;
             memcpy(ptr, buf, len);
             ptr += stride;
@@ -222,29 +200,16 @@ static int sunrast_decode_frame(AVCodecContext *avctx, void *data,
         av_freep(&ptr_free);
     }
 
-    *picture   = s->picture;
     *got_frame = 1;
 
     return buf - bufstart;
 }
 
-static av_cold int sunrast_end(AVCodecContext *avctx) {
-    SUNRASTContext *s = avctx->priv_data;
-
-    if(s->picture.data[0])
-        avctx->release_buffer(avctx, &s->picture);
-
-    return 0;
-}
-
 AVCodec ff_sunrast_decoder = {
     .name           = "sunrast",
+    .long_name      = NULL_IF_CONFIG_SMALL("Sun Rasterfile image"),
     .type           = AVMEDIA_TYPE_VIDEO,
     .id             = AV_CODEC_ID_SUNRAST,
-    .priv_data_size = sizeof(SUNRASTContext),
-    .init           = sunrast_init,
-    .close          = sunrast_end,
     .decode         = sunrast_decode_frame,
-    .capabilities   = CODEC_CAP_DR1,
-    .long_name      = NULL_IF_CONFIG_SMALL("Sun Rasterfile image"),
+    .capabilities   = AV_CODEC_CAP_DR1,
 };

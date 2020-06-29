@@ -27,7 +27,7 @@
 #include "libavutil/imgutils.h"
 
 #include "avcodec.h"
-#include "dsputil.h"
+#include "mpegutils.h"
 #include "mpegvideo.h"
 #include "golomb.h"
 
@@ -109,6 +109,8 @@ static int get_dimension(GetBitContext *gb, const int *dim)
         val = dim[get_bits1(gb) - val];
     if(!val){
         do{
+            if (get_bits_left(gb) < 8)
+                return AVERROR_INVALIDDATA;
             t = get_bits(gb, 8);
             val += t << 2;
         }while(t == 0xFF);
@@ -130,22 +132,23 @@ static int rv40_parse_slice_header(RV34DecContext *r, GetBitContext *gb, SliceIn
     int mb_bits;
     int w = r->s.width, h = r->s.height;
     int mb_size;
+    int ret;
 
     memset(si, 0, sizeof(SliceInfo));
     if(get_bits1(gb))
-        return -1;
+        return AVERROR_INVALIDDATA;
     si->type = get_bits(gb, 2);
     if(si->type == 1) si->type = 0;
     si->quant = get_bits(gb, 5);
     if(get_bits(gb, 2))
-        return -1;
+        return AVERROR_INVALIDDATA;
     si->vlc_set = get_bits(gb, 2);
     skip_bits1(gb);
     si->pts = get_bits(gb, 13);
     if(!si->type || !get_bits1(gb))
         rv40_parse_picture_size(gb, &w, &h);
-    if(av_image_check_size(w, h, 0, r->s.avctx) < 0)
-        return -1;
+    if ((ret = av_image_check_size(w, h, 0, r->s.avctx)) < 0)
+        return ret;
     si->width  = w;
     si->height = h;
     mb_size = ((w + 15) >> 4) * ((h + 15) >> 4);
@@ -186,7 +189,7 @@ static int rv40_decode_intra_types(RV34DecContext *r, GetBitContext *gb, int8_t 
             A = ptr[-r->intra_types_stride + 1]; // it won't be used for the last coefficient in a row
             B = ptr[-r->intra_types_stride];
             C = ptr[-1];
-            pattern = A + (B << 4) + (C << 8);
+            pattern = A + B * (1 << 4) + C * (1 << 8);
             for(k = 0; k < MODE2_PATTERNS_NUM; k++)
                 if(pattern == rv40_aic_table_index[k])
                     break;
@@ -230,7 +233,7 @@ static int rv40_decode_mb_info(RV34DecContext *r)
     int mb_pos = s->mb_x + s->mb_y * s->mb_stride;
 
     if(!r->s.mb_skip_run) {
-        r->s.mb_skip_run = svq3_get_ue_golomb(gb) + 1;
+        r->s.mb_skip_run = get_interleaved_ue_golomb(gb) + 1;
         if(r->s.mb_skip_run > (unsigned)s->mb_num)
             return -1;
     }
@@ -360,14 +363,14 @@ static void rv40_loop_filter(RV34DecContext *r, int row)
     int uvcbp[4][2];
     /**
      * This mask represents the pattern of luma subblocks that should be filtered
-     * in addition to the coded ones because because they lie at the edge of
+     * in addition to the coded ones because they lie at the edge of
      * 8x8 block with different enough motion vectors
      */
     unsigned mvmasks[4];
 
     mb_pos = row * s->mb_stride;
     for(mb_x = 0; mb_x < s->mb_width; mb_x++, mb_pos++){
-        int mbtype = s->current_picture_ptr->f.mb_type[mb_pos];
+        int mbtype = s->current_picture_ptr->mb_type[mb_pos];
         if(IS_INTRA(mbtype) || IS_SEPARATE_DC(mbtype))
             r->cbp_luma  [mb_pos] = r->deblock_coefs[mb_pos] = 0xFFFF;
         if(IS_INTRA(mbtype))
@@ -382,7 +385,7 @@ static void rv40_loop_filter(RV34DecContext *r, int row)
         unsigned y_to_deblock;
         int c_to_deblock[2];
 
-        q = s->current_picture_ptr->f.qscale_table[mb_pos];
+        q = s->current_picture_ptr->qscale_table[mb_pos];
         alpha = rv40_alpha_tab[q];
         beta  = rv40_beta_tab [q];
         betaY = betaC = beta * 3;
@@ -397,7 +400,7 @@ static void rv40_loop_filter(RV34DecContext *r, int row)
             if(avail[i]){
                 int pos = mb_pos + neighbour_offs_x[i] + neighbour_offs_y[i]*s->mb_stride;
                 mvmasks[i] = r->deblock_coefs[pos];
-                mbtype [i] = s->current_picture_ptr->f.mb_type[pos];
+                mbtype [i] = s->current_picture_ptr->mb_type[pos];
                 cbp    [i] = r->cbp_luma[pos];
                 uvcbp[i][0] = r->cbp_chroma[pos] & 0xF;
                 uvcbp[i][1] = r->cbp_chroma[pos] >> 4;
@@ -456,7 +459,7 @@ static void rv40_loop_filter(RV34DecContext *r, int row)
         }
 
         for(j = 0; j < 16; j += 4){
-            Y = s->current_picture_ptr->f.data[0] + mb_x*16 + (row*16 + j) * s->linesize;
+            Y = s->current_picture_ptr->f->data[0] + mb_x*16 + (row*16 + j) * s->linesize;
             for(i = 0; i < 4; i++, Y += 4){
                 int ij = i + j;
                 int clip_cur = y_to_deblock & (MASK_CUR << ij) ? clip[POS_CUR] : 0;
@@ -501,7 +504,7 @@ static void rv40_loop_filter(RV34DecContext *r, int row)
         }
         for(k = 0; k < 2; k++){
             for(j = 0; j < 2; j++){
-                C = s->current_picture_ptr->f.data[k + 1] + mb_x*8 + (row*8 + j*4) * s->uvlinesize;
+                C = s->current_picture_ptr->f->data[k + 1] + mb_x*8 + (row*8 + j*4) * s->uvlinesize;
                 for(i = 0; i < 2; i++, C += 4){
                     int ij = i + j*2;
                     int clip_cur = c_to_deblock[k] & (MASK_CUR << ij) ? clip[POS_CUR] : 0;
@@ -548,9 +551,11 @@ static void rv40_loop_filter(RV34DecContext *r, int row)
 static av_cold int rv40_decode_init(AVCodecContext *avctx)
 {
     RV34DecContext *r = avctx->priv_data;
+    int ret;
 
     r->rv30 = 0;
-    ff_rv34_decode_init(avctx);
+    if ((ret = ff_rv34_decode_init(avctx)) < 0)
+        return ret;
     if(!aic_top_vlc.bits)
         rv40_init_tables();
     r->parse_slice_header = rv40_parse_slice_header;
@@ -564,17 +569,20 @@ static av_cold int rv40_decode_init(AVCodecContext *avctx)
 
 AVCodec ff_rv40_decoder = {
     .name                  = "rv40",
+    .long_name             = NULL_IF_CONFIG_SMALL("RealVideo 4.0"),
     .type                  = AVMEDIA_TYPE_VIDEO,
     .id                    = AV_CODEC_ID_RV40,
     .priv_data_size        = sizeof(RV34DecContext),
     .init                  = rv40_decode_init,
     .close                 = ff_rv34_decode_end,
     .decode                = ff_rv34_decode_frame,
-    .capabilities          = CODEC_CAP_DR1 | CODEC_CAP_DELAY |
-                             CODEC_CAP_FRAME_THREADS,
+    .capabilities          = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY |
+                             AV_CODEC_CAP_FRAME_THREADS,
     .flush                 = ff_mpeg_flush,
-    .long_name             = NULL_IF_CONFIG_SMALL("RealVideo 4.0"),
-    .pix_fmts              = ff_pixfmt_list_420,
-    .init_thread_copy      = ONLY_IF_THREADS_ENABLED(ff_rv34_decode_init_thread_copy),
+    .pix_fmts              = (const enum AVPixelFormat[]) {
+        AV_PIX_FMT_YUV420P,
+        AV_PIX_FMT_NONE
+    },
     .update_thread_context = ONLY_IF_THREADS_ENABLED(ff_rv34_decode_update_thread_context),
+    .caps_internal         = FF_CODEC_CAP_ALLOCATE_PROGRESS,
 };

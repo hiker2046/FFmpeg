@@ -27,7 +27,6 @@
 #include "targa.h"
 
 typedef struct TargaContext {
-    AVFrame picture;
     GetByteContext gb;
 } TargaContext;
 
@@ -40,7 +39,7 @@ static uint8_t *advance_line(uint8_t *start, uint8_t *line,
         return line + interleave * stride;
     } else {
         *y = (*y + 1) & (interleave - 1);
-        if (*y) {
+        if (*y && *y < h) {
             return start + *y * stride;
         } else {
             return NULL;
@@ -112,8 +111,7 @@ static int decode_frame(AVCodecContext *avctx,
                         AVPacket *avpkt)
 {
     TargaContext * const s = avctx->priv_data;
-    AVFrame *picture = data;
-    AVFrame * const p = &s->picture;
+    AVFrame * const p = data;
     uint8_t *dst;
     int stride;
     int idlen, pal, compr, y, w, h, bpp, flags, ret;
@@ -134,18 +132,18 @@ static int decode_frame(AVCodecContext *avctx,
     h         = bytestream2_get_le16(&s->gb);
     bpp       = bytestream2_get_byte(&s->gb);
 
-    if (bytestream2_get_bytes_left(&s->gb) <= idlen) {
-        av_log(avctx, AV_LOG_ERROR,
-                "Not enough data to read header\n");
-        return AVERROR_INVALIDDATA;
-    }
-
     flags     = bytestream2_get_byte(&s->gb);
 
     if (!pal && (first_clr || colors || csize)) {
         av_log(avctx, AV_LOG_WARNING, "File without colormap has colormap information set.\n");
         // specification says we should ignore those value in this case
         first_clr = colors = csize = 0;
+    }
+
+    if (bytestream2_get_bytes_left(&s->gb) < idlen + 2*colors) {
+        av_log(avctx, AV_LOG_ERROR,
+                "Not enough data to read header\n");
+        return AVERROR_INVALIDDATA;
     }
 
     // skip identifier if any
@@ -170,22 +168,17 @@ static int decode_frame(AVCodecContext *avctx,
         return AVERROR_INVALIDDATA;
     }
 
-    if (s->picture.data[0])
-        avctx->release_buffer(avctx, &s->picture);
-
     if (colors && (colors + first_clr) > 256) {
         av_log(avctx, AV_LOG_ERROR, "Incorrect palette: %i colors with offset %i\n", colors, first_clr);
         return AVERROR_INVALIDDATA;
     }
 
-    if ((ret = av_image_check_size(w, h, 0, avctx)))
+    if ((ret = ff_set_dimensions(avctx, w, h)) < 0)
         return ret;
-    if (w != avctx->width || h != avctx->height)
-        avcodec_set_dimensions(avctx, w, h);
-    if ((ret = ff_get_buffer(avctx, p)) < 0) {
-        av_log(avctx, AV_LOG_ERROR, "get_buffer() failed\n");
+
+    if ((ret = ff_get_buffer(avctx, p, 0)) < 0)
         return ret;
-    }
+    p->pict_type = AV_PICTURE_TYPE_I;
 
     if (flags & TGA_TOPTOBOTTOM) {
         dst = p->data[0];
@@ -200,6 +193,7 @@ static int decode_frame(AVCodecContext *avctx,
 
     if (colors) {
         int pal_size, pal_sample_size;
+
         switch (csize) {
         case 32: pal_sample_size = 4; break;
         case 24: pal_sample_size = 3; break;
@@ -267,70 +261,48 @@ static int decode_frame(AVCodecContext *avctx,
             line = dst;
             y = 0;
             do {
-                bytestream2_get_bufferu(&s->gb, line, img_size);
+                bytestream2_get_buffer(&s->gb, line, img_size);
                 line = advance_line(dst, line, stride, &y, h, interleave);
             } while (line);
         }
-    }
 
-    if (flags & TGA_RIGHTTOLEFT) { // right-to-left, needs horizontal flip
-        int x;
-        for (y = 0; y < h; y++) {
-            void *line = &p->data[0][y * p->linesize[0]];
-            for (x = 0; x < w >> 1; x++) {
-                switch (bpp) {
-                case 32:
-                    FFSWAP(uint32_t, ((uint32_t *)line)[x], ((uint32_t *)line)[w - x - 1]);
-                    break;
-                case 24:
-                    FFSWAP(uint8_t, ((uint8_t *)line)[3 * x    ], ((uint8_t *)line)[3 * w - 3 * x - 3]);
-                    FFSWAP(uint8_t, ((uint8_t *)line)[3 * x + 1], ((uint8_t *)line)[3 * w - 3 * x - 2]);
-                    FFSWAP(uint8_t, ((uint8_t *)line)[3 * x + 2], ((uint8_t *)line)[3 * w - 3 * x - 1]);
-                    break;
-                case 16:
-                    FFSWAP(uint16_t, ((uint16_t *)line)[x], ((uint16_t *)line)[w - x - 1]);
-                    break;
-                case 8:
-                    FFSWAP(uint8_t, ((uint8_t *)line)[x], ((uint8_t *)line)[w - x - 1]);
+        if (flags & TGA_RIGHTTOLEFT) { // right-to-left, needs horizontal flip
+            int x;
+            for (y = 0; y < h; y++) {
+                void *line = &p->data[0][y * p->linesize[0]];
+                for (x = 0; x < w >> 1; x++) {
+                    switch (bpp) {
+                    case 32:
+                        FFSWAP(uint32_t, ((uint32_t *)line)[x], ((uint32_t *)line)[w - x - 1]);
+                        break;
+                    case 24:
+                        FFSWAP(uint8_t, ((uint8_t *)line)[3 * x    ], ((uint8_t *)line)[3 * w - 3 * x - 3]);
+                        FFSWAP(uint8_t, ((uint8_t *)line)[3 * x + 1], ((uint8_t *)line)[3 * w - 3 * x - 2]);
+                        FFSWAP(uint8_t, ((uint8_t *)line)[3 * x + 2], ((uint8_t *)line)[3 * w - 3 * x - 1]);
+                        break;
+                    case 16:
+                        FFSWAP(uint16_t, ((uint16_t *)line)[x], ((uint16_t *)line)[w - x - 1]);
+                        break;
+                    case 8:
+                        FFSWAP(uint8_t, ((uint8_t *)line)[x], ((uint8_t *)line)[w - x - 1]);
+                    }
                 }
             }
         }
     }
 
-    *picture   = s->picture;
+
     *got_frame = 1;
 
     return avpkt->size;
 }
 
-static av_cold int targa_init(AVCodecContext *avctx)
-{
-    TargaContext *s = avctx->priv_data;
-
-    avcodec_get_frame_defaults(&s->picture);
-    avctx->coded_frame = &s->picture;
-
-    return 0;
-}
-
-static av_cold int targa_end(AVCodecContext *avctx)
-{
-    TargaContext *s = avctx->priv_data;
-
-    if (s->picture.data[0])
-        avctx->release_buffer(avctx, &s->picture);
-
-    return 0;
-}
-
 AVCodec ff_targa_decoder = {
     .name           = "targa",
+    .long_name      = NULL_IF_CONFIG_SMALL("Truevision Targa image"),
     .type           = AVMEDIA_TYPE_VIDEO,
     .id             = AV_CODEC_ID_TARGA,
     .priv_data_size = sizeof(TargaContext),
-    .init           = targa_init,
-    .close          = targa_end,
     .decode         = decode_frame,
-    .capabilities   = CODEC_CAP_DR1,
-    .long_name      = NULL_IF_CONFIG_SMALL("Truevision Targa image"),
+    .capabilities   = AV_CODEC_CAP_DR1,
 };

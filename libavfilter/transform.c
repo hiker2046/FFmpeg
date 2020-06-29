@@ -103,12 +103,19 @@ INTERPOLATE_METHOD(interpolate_biquadratic)
     }
 }
 
-void avfilter_get_matrix(float x_shift, float y_shift, float angle, float zoom, float *matrix) {
-    matrix[0] = zoom * cos(angle);
+void ff_get_matrix(
+    float x_shift,
+    float y_shift,
+    float angle,
+    float scale_x,
+    float scale_y,
+    float *matrix
+) {
+    matrix[0] = scale_x * cos(angle);
     matrix[1] = -sin(angle);
     matrix[2] = x_shift;
     matrix[3] = -matrix[1];
-    matrix[4] = matrix[0];
+    matrix[4] = scale_y * cos(angle);
     matrix[5] = y_shift;
     matrix[6] = 0;
     matrix[7] = 0;
@@ -134,16 +141,6 @@ void avfilter_mul_matrix(const float *m1, float scalar, float *result)
     int i;
     for (i = 0; i < 9; i++)
         result[i] = m1[i] * scalar;
-}
-
-static inline int mirror(int v, int m)
-{
-    while ((unsigned)v > (unsigned)m) {
-        v = -v;
-        if (v < 0)
-            v += 2 * m;
-    }
-    return v;
 }
 
 int avfilter_transform(const uint8_t *src, uint8_t *dst,
@@ -186,8 +183,8 @@ int avfilter_transform(const uint8_t *src, uint8_t *dst,
                     def = src[(int)y_s * src_stride + (int)x_s];
                     break;
                 case FILL_MIRROR:
-                    x_s = mirror(x_s,  width-1);
-                    y_s = mirror(y_s, height-1);
+                    x_s = avpriv_mirror(x_s,  width-1);
+                    y_s = avpriv_mirror(y_s, height-1);
 
                     av_assert2(x_s >= 0 && y_s >= 0);
                     av_assert2(x_s < width && y_s < height);
@@ -199,4 +196,3 @@ int avfilter_transform(const uint8_t *src, uint8_t *dst,
     }
     return 0;
 }
-

@@ -19,8 +19,11 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 #include "avformat.h"
+#include "libavutil/avassert.h"
 #include "libavutil/parseutils.h"
 #include "libavutil/opt.h"
+#include "libavutil/time.h"
+
 #include "internal.h"
 #include "network.h"
 #include "os_support.h"
@@ -33,26 +36,68 @@ typedef struct TCPContext {
     const AVClass *class;
     int fd;
     int listen;
+    int open_timeout;
     int rw_timeout;
     int listen_timeout;
+    int recv_buffer_size;
+    int send_buffer_size;
+    int tcp_nodelay;
+#if !HAVE_WINSOCK2_H
+    int tcp_mss;
+#endif /* !HAVE_WINSOCK2_H */
 } TCPContext;
 
 #define OFFSET(x) offsetof(TCPContext, x)
 #define D AV_OPT_FLAG_DECODING_PARAM
 #define E AV_OPT_FLAG_ENCODING_PARAM
 static const AVOption options[] = {
-{"listen", "listen on port instead of connecting", OFFSET(listen), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 1, D|E },
-{"timeout", "timeout of socket i/o operations", OFFSET(rw_timeout), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, D|E },
-{"listen_timeout", "connection awaiting timeout", OFFSET(listen_timeout), AV_OPT_TYPE_INT, {.i64 = -1}, -1, INT_MAX, D|E },
-{NULL}
+    { "listen",          "Listen for incoming connections",  OFFSET(listen),         AV_OPT_TYPE_INT, { .i64 = 0 },     0,       2,       .flags = D|E },
+    { "timeout",     "set timeout (in microseconds) of socket I/O operations", OFFSET(rw_timeout),     AV_OPT_TYPE_INT, { .i64 = -1 },         -1, INT_MAX, .flags = D|E },
+    { "listen_timeout",  "Connection awaiting timeout (in milliseconds)",      OFFSET(listen_timeout), AV_OPT_TYPE_INT, { .i64 = -1 },         -1, INT_MAX, .flags = D|E },
+    { "send_buffer_size", "Socket send buffer size (in bytes)",                OFFSET(send_buffer_size), AV_OPT_TYPE_INT, { .i64 = -1 },         -1, INT_MAX, .flags = D|E },
+    { "recv_buffer_size", "Socket receive buffer size (in bytes)",             OFFSET(recv_buffer_size), AV_OPT_TYPE_INT, { .i64 = -1 },         -1, INT_MAX, .flags = D|E },
+    { "tcp_nodelay", "Use TCP_NODELAY to disable nagle's algorithm",           OFFSET(tcp_nodelay), AV_OPT_TYPE_BOOL, { .i64 = 0 },             0, 1, .flags = D|E },
+#if !HAVE_WINSOCK2_H
+    { "tcp_mss",     "Maximum segment size for outgoing TCP packets",          OFFSET(tcp_mss),     AV_OPT_TYPE_INT, { .i64 = -1 },         -1, INT_MAX, .flags = D|E },
+#endif /* !HAVE_WINSOCK2_H */
+    { NULL }
 };
 
-static const AVClass tcp_context_class = {
+static const AVClass tcp_class = {
     .class_name = "tcp",
     .item_name  = av_default_item_name,
     .option     = options,
     .version    = LIBAVUTIL_VERSION_INT,
 };
+
+static void customize_fd(void *ctx, int fd)
+{
+    TCPContext *s = ctx;
+    /* Set the socket's send or receive buffer sizes, if specified.
+       If unspecified or setting fails, system default is used. */
+    if (s->recv_buffer_size > 0) {
+        if (setsockopt (fd, SOL_SOCKET, SO_RCVBUF, &s->recv_buffer_size, sizeof (s->recv_buffer_size))) {
+            ff_log_net_error(ctx, AV_LOG_WARNING, "setsockopt(SO_RCVBUF)");
+        }
+    }
+    if (s->send_buffer_size > 0) {
+        if (setsockopt (fd, SOL_SOCKET, SO_SNDBUF, &s->send_buffer_size, sizeof (s->send_buffer_size))) {
+            ff_log_net_error(ctx, AV_LOG_WARNING, "setsockopt(SO_SNDBUF)");
+        }
+    }
+    if (s->tcp_nodelay > 0) {
+        if (setsockopt (fd, IPPROTO_TCP, TCP_NODELAY, &s->tcp_nodelay, sizeof (s->tcp_nodelay))) {
+            ff_log_net_error(ctx, AV_LOG_WARNING, "setsockopt(TCP_NODELAY)");
+        }
+    }
+#if !HAVE_WINSOCK2_H
+    if (s->tcp_mss > 0) {
+        if (setsockopt (fd, IPPROTO_TCP, TCP_MAXSEG, &s->tcp_mss, sizeof (s->tcp_mss))) {
+            ff_log_net_error(ctx, AV_LOG_WARNING, "setsockopt(TCP_MAXSEG)");
+        }
+    }
+#endif /* !HAVE_WINSOCK2_H */
+}
 
 /* return non zero if error */
 static int tcp_open(URLContext *h, const char *uri, int flags)
@@ -63,10 +108,9 @@ static int tcp_open(URLContext *h, const char *uri, int flags)
     const char *p;
     char buf[256];
     int ret;
-    socklen_t optlen;
     char hostname[1024],proto[1024],path[1024];
     char portstr[10];
-    h->rw_timeout = 5000000;
+    s->open_timeout = 5000000;
 
     av_url_split(proto, sizeof(proto), NULL, 0, hostname, sizeof(hostname),
         &port, path, sizeof(path), uri);
@@ -78,8 +122,13 @@ static int tcp_open(URLContext *h, const char *uri, int flags)
     }
     p = strchr(uri, '?');
     if (p) {
-        if (av_find_info_tag(buf, sizeof(buf), "listen", p))
-            s->listen = 1;
+        if (av_find_info_tag(buf, sizeof(buf), "listen", p)) {
+            char *endptr = NULL;
+            s->listen = strtol(buf, &endptr, 10);
+            /* assume if no digits were found it is a request to enable it */
+            if (buf == endptr)
+                s->listen = 1;
+        }
         if (av_find_info_tag(buf, sizeof(buf), "timeout", p)) {
             s->rw_timeout = strtol(buf, NULL, 10);
         }
@@ -87,7 +136,10 @@ static int tcp_open(URLContext *h, const char *uri, int flags)
             s->listen_timeout = strtol(buf, NULL, 10);
         }
     }
-    h->rw_timeout = s->rw_timeout;
+    if (s->rw_timeout >= 0) {
+        s->open_timeout =
+        h->rw_timeout   = s->rw_timeout;
+    }
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     snprintf(portstr, sizeof(portstr), "%d", port);
@@ -106,108 +158,77 @@ static int tcp_open(URLContext *h, const char *uri, int flags)
 
     cur_ai = ai;
 
- restart:
-    ret = AVERROR(EIO);
-    fd = socket(cur_ai->ai_family, cur_ai->ai_socktype, cur_ai->ai_protocol);
-    if (fd < 0)
-        goto fail;
+#if HAVE_STRUCT_SOCKADDR_IN6
+    // workaround for IOS9 getaddrinfo in IPv6 only network use hardcode IPv4 address can not resolve port number.
+    if (cur_ai->ai_family == AF_INET6){
+        struct sockaddr_in6 * sockaddr_v6 = (struct sockaddr_in6 *)cur_ai->ai_addr;
+        if (!sockaddr_v6->sin6_port){
+            sockaddr_v6->sin6_port = htons(port);
+        }
+    }
+#endif
 
-    if (s->listen) {
-        int fd1;
-        int reuse = 1;
-        struct pollfd lp = { fd, POLLIN, 0 };
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-        ret = bind(fd, cur_ai->ai_addr, cur_ai->ai_addrlen);
-        if (ret) {
-            ret = ff_neterrno();
-            goto fail1;
+    if (s->listen > 0) {
+        while (cur_ai && fd < 0) {
+            fd = ff_socket(cur_ai->ai_family,
+                           cur_ai->ai_socktype,
+                           cur_ai->ai_protocol);
+            if (fd < 0) {
+                ret = ff_neterrno();
+                cur_ai = cur_ai->ai_next;
+            }
         }
-        ret = listen(fd, 1);
-        if (ret) {
-            ret = ff_neterrno();
+        if (fd < 0)
             goto fail1;
-        }
-        ret = poll(&lp, 1, s->listen_timeout >= 0 ? s->listen_timeout : -1);
-        if (ret <= 0) {
-            ret = AVERROR(ETIMEDOUT);
+        customize_fd(s, fd);
+    }
+
+    if (s->listen == 2) {
+        // multi-client
+        if ((ret = ff_listen(fd, cur_ai->ai_addr, cur_ai->ai_addrlen)) < 0)
             goto fail1;
-        }
-        fd1 = accept(fd, NULL, NULL);
-        if (fd1 < 0) {
-            ret = ff_neterrno();
+    } else if (s->listen == 1) {
+        // single client
+        if ((ret = ff_listen_bind(fd, cur_ai->ai_addr, cur_ai->ai_addrlen,
+                                  s->listen_timeout, h)) < 0)
             goto fail1;
-        }
-        closesocket(fd);
-        fd = fd1;
-        ff_socket_nonblock(fd, 1);
+        // Socket descriptor already closed here. Safe to overwrite to client one.
+        fd = ret;
     } else {
- redo:
-        ff_socket_nonblock(fd, 1);
-        ret = connect(fd, cur_ai->ai_addr, cur_ai->ai_addrlen);
+        ret = ff_connect_parallel(ai, s->open_timeout / 1000, 3, h, &fd, customize_fd, s);
+        if (ret < 0)
+            goto fail1;
     }
 
-    if (ret < 0) {
-        struct pollfd p = {fd, POLLOUT, 0};
-        int64_t wait_started;
-        ret = ff_neterrno();
-        if (ret == AVERROR(EINTR)) {
-            if (ff_check_interrupt(&h->interrupt_callback)) {
-                ret = AVERROR_EXIT;
-                goto fail1;
-            }
-            goto redo;
-        }
-        if (ret != AVERROR(EINPROGRESS) &&
-            ret != AVERROR(EAGAIN))
-            goto fail;
-
-        /* wait until we are connected or until abort */
-        wait_started = av_gettime();
-        do {
-            if (ff_check_interrupt(&h->interrupt_callback)) {
-                ret = AVERROR_EXIT;
-                goto fail1;
-            }
-            ret = poll(&p, 1, 100);
-            if (ret > 0)
-                break;
-        } while (!h->rw_timeout || (av_gettime() - wait_started < h->rw_timeout));
-        if (ret <= 0) {
-            ret = AVERROR(ETIMEDOUT);
-            goto fail;
-        }
-        /* test error */
-        optlen = sizeof(ret);
-        if (getsockopt (fd, SOL_SOCKET, SO_ERROR, &ret, &optlen))
-            ret = AVUNERROR(ff_neterrno());
-        if (ret != 0) {
-            char errbuf[100];
-            ret = AVERROR(ret);
-            av_strerror(ret, errbuf, sizeof(errbuf));
-            av_log(h, AV_LOG_ERROR,
-                   "TCP connection to %s:%d failed: %s\n",
-                   hostname, port, errbuf);
-            goto fail;
-        }
-    }
     h->is_streamed = 1;
     s->fd = fd;
+
     freeaddrinfo(ai);
     return 0;
 
- fail:
-    if (cur_ai->ai_next) {
-        /* Retry with the next sockaddr */
-        cur_ai = cur_ai->ai_next;
-        if (fd >= 0)
-            closesocket(fd);
-        goto restart;
-    }
  fail1:
     if (fd >= 0)
         closesocket(fd);
     freeaddrinfo(ai);
     return ret;
+}
+
+static int tcp_accept(URLContext *s, URLContext **c)
+{
+    TCPContext *sc = s->priv_data;
+    TCPContext *cc;
+    int ret;
+    av_assert0(sc->listen);
+    if ((ret = ffurl_alloc(c, s->filename, s->flags, &s->interrupt_callback)) < 0)
+        return ret;
+    cc = (*c)->priv_data;
+    ret = ff_accept(sc->fd, sc->listen_timeout, s);
+    if (ret < 0) {
+        ffurl_closep(c);
+        return ret;
+    }
+    cc->fd = ret;
+    return 0;
 }
 
 static int tcp_read(URLContext *h, uint8_t *buf, int size)
@@ -221,6 +242,8 @@ static int tcp_read(URLContext *h, uint8_t *buf, int size)
             return ret;
     }
     ret = recv(s->fd, buf, size, 0);
+    if (ret == 0)
+        return AVERROR_EOF;
     return ret < 0 ? ff_neterrno() : ret;
 }
 
@@ -234,7 +257,7 @@ static int tcp_write(URLContext *h, const uint8_t *buf, int size)
         if (ret)
             return ret;
     }
-    ret = send(s->fd, buf, size, 0);
+    ret = send(s->fd, buf, size, MSG_NOSIGNAL);
     return ret < 0 ? ff_neterrno() : ret;
 }
 
@@ -267,15 +290,37 @@ static int tcp_get_file_handle(URLContext *h)
     return s->fd;
 }
 
-URLProtocol ff_tcp_protocol = {
+static int tcp_get_window_size(URLContext *h)
+{
+    TCPContext *s = h->priv_data;
+    int avail;
+    socklen_t avail_len = sizeof(avail);
+
+#if HAVE_WINSOCK2_H
+    /* SO_RCVBUF with winsock only reports the actual TCP window size when
+    auto-tuning has been disabled via setting SO_RCVBUF */
+    if (s->recv_buffer_size < 0) {
+        return AVERROR(ENOSYS);
+    }
+#endif
+
+    if (getsockopt(s->fd, SOL_SOCKET, SO_RCVBUF, &avail, &avail_len)) {
+        return ff_neterrno();
+    }
+    return avail;
+}
+
+const URLProtocol ff_tcp_protocol = {
     .name                = "tcp",
     .url_open            = tcp_open,
+    .url_accept          = tcp_accept,
     .url_read            = tcp_read,
     .url_write           = tcp_write,
     .url_close           = tcp_close,
     .url_get_file_handle = tcp_get_file_handle,
+    .url_get_short_seek  = tcp_get_window_size,
     .url_shutdown        = tcp_shutdown,
     .priv_data_size      = sizeof(TCPContext),
-    .priv_data_class     = &tcp_context_class,
     .flags               = URL_PROTOCOL_FLAG_NETWORK,
+    .priv_data_class     = &tcp_class,
 };

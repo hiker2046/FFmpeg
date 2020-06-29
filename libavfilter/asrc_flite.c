@@ -32,7 +32,7 @@
 #include "formats.h"
 #include "internal.h"
 
-typedef struct {
+typedef struct FliteContext {
     const AVClass *class;
     char *voice_str;
     char *textfile;
@@ -51,13 +51,13 @@ typedef struct {
 #define FLAGS AV_OPT_FLAG_AUDIO_PARAM|AV_OPT_FLAG_FILTERING_PARAM
 
 static const AVOption flite_options[] = {
-    { "list_voices", "list voices and exit",              OFFSET(list_voices), AV_OPT_TYPE_INT, {.i64=0}, 0, 1, FLAGS },
+    { "list_voices", "list voices and exit",              OFFSET(list_voices), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS },
     { "nb_samples",  "set number of samples per frame",   OFFSET(frame_nb_samples), AV_OPT_TYPE_INT, {.i64=512}, 0, INT_MAX, FLAGS },
     { "n",           "set number of samples per frame",   OFFSET(frame_nb_samples), AV_OPT_TYPE_INT, {.i64=512}, 0, INT_MAX, FLAGS },
-    { "text",        "set text to speak",                 OFFSET(text),      AV_OPT_TYPE_STRING, {.str=NULL}, CHAR_MIN, CHAR_MAX, FLAGS },
-    { "textfile",    "set filename of the text to speak", OFFSET(textfile),  AV_OPT_TYPE_STRING, {.str=NULL}, CHAR_MIN, CHAR_MAX, FLAGS },
-    { "v",           "set voice",                         OFFSET(voice_str), AV_OPT_TYPE_STRING, {.str="kal"}, CHAR_MIN, CHAR_MAX, FLAGS },
-    { "voice",       "set voice",                         OFFSET(voice_str), AV_OPT_TYPE_STRING, {.str="kal"}, CHAR_MIN, CHAR_MAX, FLAGS },
+    { "text",        "set text to speak",                 OFFSET(text),      AV_OPT_TYPE_STRING, {.str=NULL}, 0, 0, FLAGS },
+    { "textfile",    "set filename of the text to speak", OFFSET(textfile),  AV_OPT_TYPE_STRING, {.str=NULL}, 0, 0, FLAGS },
+    { "v",           "set voice",                         OFFSET(voice_str), AV_OPT_TYPE_STRING, {.str="kal"}, 0, 0, FLAGS },
+    { "voice",       "set voice",                         OFFSET(voice_str), AV_OPT_TYPE_STRING, {.str="kal"}, 0, 0, FLAGS },
     { NULL }
 };
 
@@ -131,16 +131,10 @@ static int select_voice(struct voice_entry **entry_ret, const char *voice_name, 
     return AVERROR(EINVAL);
 }
 
-static av_cold int init(AVFilterContext *ctx, const char *args)
+static av_cold int init(AVFilterContext *ctx)
 {
     FliteContext *flite = ctx->priv;
     int ret = 0;
-
-    flite->class = &flite_class;
-    av_opt_set_defaults(flite);
-
-    if ((ret = av_set_options_string(flite, args, "=", ":")) < 0)
-        return ret;
 
     if (flite->list_voices) {
         list_voices(ctx, "\n");
@@ -176,8 +170,10 @@ static av_cold int init(AVFilterContext *ctx, const char *args)
             return ret;
         }
 
-        if (!(flite->text = av_malloc(textbuf_size+1)))
+        if (!(flite->text = av_malloc(textbuf_size+1))) {
+            av_file_unmap(textbuf, textbuf_size);
             return AVERROR(ENOMEM);
+        }
         memcpy(flite->text, textbuf, textbuf_size);
         flite->text[textbuf_size] = 0;
         av_file_unmap(textbuf, textbuf_size);
@@ -200,8 +196,6 @@ static av_cold void uninit(AVFilterContext *ctx)
 {
     FliteContext *flite = ctx->priv;
 
-    av_opt_free(flite);
-
     if (!--flite->voice_entry->usage_count)
         flite->voice_entry->unregister_fn(flite->voice);
     flite->voice = NULL;
@@ -213,18 +207,20 @@ static av_cold void uninit(AVFilterContext *ctx)
 static int query_formats(AVFilterContext *ctx)
 {
     FliteContext *flite = ctx->priv;
+    int ret;
 
     AVFilterChannelLayouts *chlayouts = NULL;
     int64_t chlayout = av_get_default_channel_layout(flite->wave->num_channels);
     AVFilterFormats *sample_formats = NULL;
     AVFilterFormats *sample_rates = NULL;
 
-    ff_add_channel_layout(&chlayouts, chlayout);
-    ff_set_common_channel_layouts(ctx, chlayouts);
-    ff_add_format(&sample_formats, AV_SAMPLE_FMT_S16);
-    ff_set_common_formats(ctx, sample_formats);
-    ff_add_format(&sample_rates, flite->wave->sample_rate);
-    ff_set_common_samplerates (ctx, sample_rates);
+    if ((ret = ff_add_channel_layout         (&chlayouts     , chlayout                )) < 0 ||
+        (ret = ff_set_common_channel_layouts (ctx            , chlayouts               )) < 0 ||
+        (ret = ff_add_format                 (&sample_formats, AV_SAMPLE_FMT_S16       )) < 0 ||
+        (ret = ff_set_common_formats         (ctx            , sample_formats          )) < 0 ||
+        (ret = ff_add_format                 (&sample_rates  , flite->wave->sample_rate)) < 0 ||
+        (ret = ff_set_common_samplerates     (ctx            , sample_rates            )) < 0)
+        return ret;
 
     return 0;
 }
@@ -245,22 +241,22 @@ static int config_props(AVFilterLink *outlink)
 
 static int request_frame(AVFilterLink *outlink)
 {
-    AVFilterBufferRef *samplesref;
+    AVFrame *samplesref;
     FliteContext *flite = outlink->src->priv;
     int nb_samples = FFMIN(flite->wave_nb_samples, flite->frame_nb_samples);
 
     if (!nb_samples)
         return AVERROR_EOF;
 
-    samplesref = ff_get_audio_buffer(outlink, AV_PERM_WRITE, nb_samples);
+    samplesref = ff_get_audio_buffer(outlink, nb_samples);
     if (!samplesref)
         return AVERROR(ENOMEM);
 
     memcpy(samplesref->data[0], flite->wave_samples,
            nb_samples * flite->wave->num_channels * 2);
     samplesref->pts = flite->pts;
-    samplesref->pos = -1;
-    samplesref->audio->sample_rate = flite->wave->sample_rate;
+    samplesref->pkt_pos = -1;
+    samplesref->sample_rate = flite->wave->sample_rate;
     flite->pts += nb_samples;
     flite->wave_samples += nb_samples * flite->wave->num_channels;
     flite->wave_nb_samples -= nb_samples;
@@ -278,14 +274,14 @@ static const AVFilterPad flite_outputs[] = {
     { NULL }
 };
 
-AVFilter avfilter_asrc_flite = {
-    .name        = "flite",
-    .description = NULL_IF_CONFIG_SMALL("Synthesize voice from text using libflite."),
+AVFilter ff_asrc_flite = {
+    .name          = "flite",
+    .description   = NULL_IF_CONFIG_SMALL("Synthesize voice from text using libflite."),
     .query_formats = query_formats,
-    .init        = init,
-    .uninit      = uninit,
-    .priv_size   = sizeof(FliteContext),
-    .inputs      = NULL,
-    .outputs     = flite_outputs,
-    .priv_class  = &flite_class,
+    .init          = init,
+    .uninit        = uninit,
+    .priv_size     = sizeof(FliteContext),
+    .inputs        = NULL,
+    .outputs       = flite_outputs,
+    .priv_class    = &flite_class,
 };

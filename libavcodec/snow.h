@@ -22,12 +22,20 @@
 #ifndef AVCODEC_SNOW_H
 #define AVCODEC_SNOW_H
 
-#include "dsputil.h"
-#include "dwt.h"
+#include "libavutil/motion_vector.h"
+
+#include "hpeldsp.h"
+#include "me_cmp.h"
+#include "qpeldsp.h"
+#include "snow_dwt.h"
 
 #include "rangecoder.h"
 #include "mathops.h"
+
 #include "mpegvideo.h"
+#include "h264qpel.h"
+
+#define FF_ME_ITER 3
 
 #define MID_STATE 128
 
@@ -41,14 +49,14 @@
 #define LOG2_OBMC_MAX 8
 #define OBMC_MAX (1<<(LOG2_OBMC_MAX))
 typedef struct BlockNode{
-    int16_t mx;
-    int16_t my;
-    uint8_t ref;
-    uint8_t color[3];
-    uint8_t type;
+    int16_t mx;                 ///< Motion vector component X, see mv_scale
+    int16_t my;                 ///< Motion vector component Y, see mv_scale
+    uint8_t ref;                ///< Reference frame index
+    uint8_t color[3];           ///< Color for intra
+    uint8_t type;               ///< Bitfield of BLOCK_*
 //#define TYPE_SPLIT    1
-#define BLOCK_INTRA   1
-#define BLOCK_OPT     2
+#define BLOCK_INTRA   1         ///< Intra block, inter otherwise
+#define BLOCK_OPT     2         ///< Block needs no checks in this round of iterative motion estiation
 //#define TYPE_NOCOLOR  4
     uint8_t level; //FIXME merge into type?
 }BlockNode;
@@ -107,14 +115,18 @@ typedef struct SnowContext{
     AVClass *class;
     AVCodecContext *avctx;
     RangeCoder c;
-    DSPContext dsp;
-    DWTContext dwt;
-    AVFrame new_picture;
-    AVFrame input_picture;              ///< new_picture with the internal linesizes
-    AVFrame current_picture;
-    AVFrame last_picture[MAX_REF_FRAMES];
+    MECmpContext mecc;
+    HpelDSPContext hdsp;
+    QpelDSPContext qdsp;
+    VideoDSPContext vdsp;
+    H264QpelContext h264qpel;
+    MpegvideoEncDSPContext mpvencdsp;
+    SnowDWTContext dwt;
+    AVFrame *input_picture;              ///< new_picture with the internal linesizes
+    AVFrame *current_picture;
+    AVFrame *last_picture[MAX_REF_FRAMES];
     uint8_t *halfpel_plane[MAX_REF_FRAMES][4][4];
-    AVFrame mconly_picture;
+    AVFrame *mconly_picture;
 //     uint8_t q_context[16];
     uint8_t header_state[32];
     uint8_t block_state[128 + 32*128];
@@ -154,6 +166,7 @@ typedef struct SnowContext{
     int b_height;
     int block_max_depth;
     int last_block_max_depth;
+    int nb_planes;
     Plane plane[MAX_PLANES];
     BlockNode *block;
 #define ME_CACHE_SIZE 1024
@@ -162,11 +175,21 @@ typedef struct SnowContext{
     slice_buffer sb;
     int memc_only;
     int no_bitstream;
+    int intra_penalty;
+    int motion_est;
+    int iterative_dia_size;
+    int scenechange_threshold;
 
     MpegEncContext m; // needed for motion estimation, should not be used for anything else, the idea is to eventually make the motion estimation independent of MpegEncContext, so this will be removed then (FIXME/XXX)
 
     uint8_t *scratchbuf;
     uint8_t *emu_edge_buffer;
+
+    AVMotionVector *avmv;
+    int avmv_index;
+    uint64_t encoding_error[AV_NUM_DATA_POINTERS];
+
+    int pred;
 }SnowContext;
 
 /* Tables */
@@ -221,35 +244,12 @@ void ff_snow_release_buffer(AVCodecContext *avctx);
 void ff_snow_reset_contexts(SnowContext *s);
 int ff_snow_alloc_blocks(SnowContext *s);
 int ff_snow_frame_start(SnowContext *s);
-void ff_snow_pred_block(SnowContext *s, uint8_t *dst, uint8_t *tmp, int stride,
-                     int sx, int sy, int b_w, int b_h, BlockNode *block,
+void ff_snow_pred_block(SnowContext *s, uint8_t *dst, uint8_t *tmp, ptrdiff_t stride,
+                     int sx, int sy, int b_w, int b_h, const BlockNode *block,
                      int plane_index, int w, int h);
+int ff_snow_get_buffer(SnowContext *s, AVFrame *frame);
 /* common inline functions */
 //XXX doublecheck all of them should stay inlined
-
-static inline void snow_set_blocks(SnowContext *s, int level, int x, int y, int l, int cb, int cr, int mx, int my, int ref, int type){
-    const int w= s->b_width << s->block_max_depth;
-    const int rem_depth= s->block_max_depth - level;
-    const int index= (x + y*w) << rem_depth;
-    const int block_w= 1<<rem_depth;
-    BlockNode block;
-    int i,j;
-
-    block.color[0]= l;
-    block.color[1]= cb;
-    block.color[2]= cr;
-    block.mx= mx;
-    block.my= my;
-    block.ref= ref;
-    block.type= type;
-    block.level= level;
-
-    for(j=0; j<block_w; j++){
-        for(i=0; i<block_w; i++){
-            s->block[index + i + j*w]= block;
-        }
-    }
-}
 
 static inline void pred_mv(SnowContext *s, int *mx, int *my, int ref,
                            const BlockNode *left, const BlockNode *top, const BlockNode *tr){
@@ -286,6 +286,8 @@ static av_always_inline void add_yblock(SnowContext *s, int sliced, slice_buffer
     BlockNode *lb= lt+b_stride;
     BlockNode *rb= lb+1;
     uint8_t *block[4];
+    // When src_stride is large enough, it is possible to interleave the blocks.
+    // Otherwise the blocks are written sequentially in the tmp buffer.
     int tmp_step= src_stride >= 7*MB_SIZE ? MB_SIZE : MB_SIZE*src_stride;
     uint8_t *tmp = s->scratchbuf;
     uint8_t *ptmp;
@@ -312,7 +314,8 @@ static av_always_inline void add_yblock(SnowContext *s, int sliced, slice_buffer
         if(!sliced && !offset_dst)
             dst -= src_x;
         src_x=0;
-    }else if(src_x + b_w > w){
+    }
+    if(src_x + b_w > w){
         b_w = w - src_x;
     }
     if(src_y<0){
@@ -321,13 +324,12 @@ static av_always_inline void add_yblock(SnowContext *s, int sliced, slice_buffer
         if(!sliced && !offset_dst)
             dst -= src_y*dst_stride;
         src_y=0;
-    }else if(src_y + b_h> h){
+    }
+    if(src_y + b_h> h){
         b_h = h - src_y;
     }
 
     if(b_w<=0 || b_h<=0) return;
-
-    av_assert2(src_stride > 2*MB_SIZE + 5);
 
     if(!sliced && offset_dst)
         dst += src_x + src_y*dst_stride;
@@ -409,8 +411,8 @@ static av_always_inline void predict_slice(SnowContext *s, IDWTELEM *buf, int pl
     int block_h    = plane_index ? block_size>>s->chroma_v_shift : block_size;
     const uint8_t *obmc  = plane_index ? ff_obmc_tab[s->block_max_depth+s->chroma_h_shift] : ff_obmc_tab[s->block_max_depth];
     const int obmc_stride= plane_index ? (2*block_size)>>s->chroma_h_shift : 2*block_size;
-    int ref_stride= s->current_picture.linesize[plane_index];
-    uint8_t *dst8= s->current_picture.data[plane_index];
+    int ref_stride= s->current_picture->linesize[plane_index];
+    uint8_t *dst8= s->current_picture->data[plane_index];
     int w= p->width;
     int h= p->height;
     av_assert2(s->chroma_h_shift == s->chroma_v_shift); // obmc params assume squares
@@ -539,10 +541,13 @@ static inline int get_symbol(RangeCoder *c, uint8_t *state, int is_signed){
     if(get_rac(c, state+0))
         return 0;
     else{
-        int i, e, a;
+        int i, e;
+        unsigned a;
         e= 0;
         while(get_rac(c, state+1 + FFMIN(e,9))){ //1..10
             e++;
+            if (e > 31)
+                return AVERROR_INVALIDDATA;
         }
 
         a= 1;
@@ -647,7 +652,10 @@ static inline void unpack_coeffs(SnowContext *s, SubBand *b, SubBand * parent, i
                 if(v){
                     v= 2*(get_symbol2(&s->c, b->state[context + 2], context-4) + 1);
                     v+=get_rac(&s->c, &b->state[0][16 + 1 + 3 + ff_quant3bA[l&0xFF] + 3*ff_quant3bA[t&0xFF]]);
-
+                    if ((uint16_t)v != v) {
+                        av_log(s->avctx, AV_LOG_ERROR, "Coefficient damaged\n");
+                        v = 1;
+                    }
                     xc->x=x;
                     (xc++)->coeff= v;
                 }
@@ -657,6 +665,10 @@ static inline void unpack_coeffs(SnowContext *s, SubBand *b, SubBand * parent, i
                     else           run= INT_MAX;
                     v= 2*(get_symbol2(&s->c, b->state[0 + 2], 0-4) + 1);
                     v+=get_rac(&s->c, &b->state[0][16 + 1 + 3]);
+                    if ((uint16_t)v != v) {
+                        av_log(s->avctx, AV_LOG_ERROR, "Coefficient damaged\n");
+                        v = 1;
+                    }
 
                     xc->x=x;
                     (xc++)->coeff= v;

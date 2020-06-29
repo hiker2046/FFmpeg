@@ -1,6 +1,6 @@
 /*
  * Quicktime Graphics (SMC) Video Decoder
- * Copyright (C) 2003 the ffmpeg project
+ * Copyright (C) 2003 The FFmpeg project
  *
  * This file is part of FFmpeg.
  *
@@ -35,6 +35,7 @@
 #include "libavutil/intreadwrite.h"
 #include "avcodec.h"
 #include "bytestream.h"
+#include "internal.h"
 
 #define CPAIR 2
 #define CQUAD 4
@@ -45,7 +46,7 @@
 typedef struct SmcContext {
 
     AVCodecContext *avctx;
-    AVFrame frame;
+    AVFrame *frame;
 
     GetByteContext gb;
 
@@ -69,7 +70,7 @@ typedef struct SmcContext {
         row_ptr += stride * 4; \
     } \
     total_blocks--; \
-    if (total_blocks < 0) \
+    if (total_blocks < !!n_blocks) \
     { \
         av_log(s->avctx, AV_LOG_INFO, "warning: block counter just went negative (this should not happen)\n"); \
         return; \
@@ -80,7 +81,7 @@ static void smc_decode_stream(SmcContext *s)
 {
     int width = s->avctx->width;
     int height = s->avctx->height;
-    int stride = s->frame.linesize[0];
+    int stride = s->frame->linesize[0];
     int i;
     int chunk_size;
     int buf_size = bytestream2_size(&s->gb);
@@ -91,9 +92,9 @@ static void smc_decode_stream(SmcContext *s)
     unsigned int color_flags_b;
     unsigned int flag_mask;
 
-    unsigned char *pixels = s->frame.data[0];
+    unsigned char * const pixels = s->frame->data[0];
 
-    int image_size = height * s->frame.linesize[0];
+    int image_size = height * s->frame->linesize[0];
     int row_ptr = 0;
     int pixel_ptr = 0;
     int pixel_x, pixel_y;
@@ -111,7 +112,7 @@ static void smc_decode_stream(SmcContext *s)
     int color_octet_index = 0;
 
     /* make the palette available */
-    memcpy(s->frame.data[1], s->pal, AVPALETTE_SIZE);
+    memcpy(s->frame->data[1], s->pal, AVPALETTE_SIZE);
 
     bytestream2_skip(&s->gb, 1);
     chunk_size = bytestream2_get_be24(&s->gb);
@@ -129,6 +130,10 @@ static void smc_decode_stream(SmcContext *s)
         if (row_ptr >= image_size) {
             av_log(s->avctx, AV_LOG_INFO, "SMC decoder just went out of bounds (row ptr = %d, height = %d)\n",
                 row_ptr, image_size);
+            return;
+        }
+        if (bytestream2_get_bytes_left(&s->gb) < 1) {
+            av_log(s->avctx, AV_LOG_ERROR, "input too small\n");
             return;
         }
 
@@ -401,7 +406,7 @@ static void smc_decode_stream(SmcContext *s)
             break;
 
         case 0xF0:
-            av_log_missing_feature(s->avctx, "0xF0 opcode", 1);
+            avpriv_request_sample(s->avctx, "0xF0 opcode");
             break;
         }
     }
@@ -416,8 +421,9 @@ static av_cold int smc_decode_init(AVCodecContext *avctx)
     s->avctx = avctx;
     avctx->pix_fmt = AV_PIX_FMT_PAL8;
 
-    avcodec_get_frame_defaults(&s->frame);
-    s->frame.data[0] = NULL;
+    s->frame = av_frame_alloc();
+    if (!s->frame)
+        return AVERROR(ENOMEM);
 
     return 0;
 }
@@ -429,27 +435,31 @@ static int smc_decode_frame(AVCodecContext *avctx,
     const uint8_t *buf = avpkt->data;
     int buf_size = avpkt->size;
     SmcContext *s = avctx->priv_data;
-    const uint8_t *pal = av_packet_get_side_data(avpkt, AV_PKT_DATA_PALETTE, NULL);
+    int pal_size;
+    const uint8_t *pal = av_packet_get_side_data(avpkt, AV_PKT_DATA_PALETTE, &pal_size);
+    int ret;
+    int total_blocks = ((s->avctx->width + 3) / 4) * ((s->avctx->height + 3) / 4);
+
+    if (total_blocks / 1024 > avpkt->size)
+        return AVERROR_INVALIDDATA;
 
     bytestream2_init(&s->gb, buf, buf_size);
 
-    s->frame.reference = 3;
-    s->frame.buffer_hints = FF_BUFFER_HINTS_VALID | FF_BUFFER_HINTS_PRESERVE |
-                            FF_BUFFER_HINTS_REUSABLE | FF_BUFFER_HINTS_READABLE;
-    if (avctx->reget_buffer(avctx, &s->frame)) {
-        av_log(s->avctx, AV_LOG_ERROR, "reget_buffer() failed\n");
-        return -1;
-    }
+    if ((ret = ff_reget_buffer(avctx, s->frame, 0)) < 0)
+        return ret;
 
-    if (pal) {
-        s->frame.palette_has_changed = 1;
+    if (pal && pal_size == AVPALETTE_SIZE) {
+        s->frame->palette_has_changed = 1;
         memcpy(s->pal, pal, AVPALETTE_SIZE);
+    } else if (pal) {
+        av_log(avctx, AV_LOG_ERROR, "Palette size %d is wrong\n", pal_size);
     }
 
     smc_decode_stream(s);
 
     *got_frame      = 1;
-    *(AVFrame*)data = s->frame;
+    if ((ret = av_frame_ref(data, s->frame)) < 0)
+        return ret;
 
     /* always report that the buffer was completely consumed */
     return buf_size;
@@ -459,20 +469,19 @@ static av_cold int smc_decode_end(AVCodecContext *avctx)
 {
     SmcContext *s = avctx->priv_data;
 
-    if (s->frame.data[0])
-        avctx->release_buffer(avctx, &s->frame);
+    av_frame_free(&s->frame);
 
     return 0;
 }
 
 AVCodec ff_smc_decoder = {
     .name           = "smc",
+    .long_name      = NULL_IF_CONFIG_SMALL("QuickTime Graphics (SMC)"),
     .type           = AVMEDIA_TYPE_VIDEO,
     .id             = AV_CODEC_ID_SMC,
     .priv_data_size = sizeof(SmcContext),
     .init           = smc_decode_init,
     .close          = smc_decode_end,
     .decode         = smc_decode_frame,
-    .capabilities   = CODEC_CAP_DR1,
-    .long_name      = NULL_IF_CONFIG_SMALL("QuickTime Graphics (SMC)"),
+    .capabilities   = AV_CODEC_CAP_DR1,
 };

@@ -5,34 +5,33 @@
 ;*
 ;* Authors: Daniel Kang <daniel.d.kang@gmail.com>
 ;*
-;* This file is part of Libav.
+;* This file is part of FFmpeg.
 ;*
-;* Libav is free software; you can redistribute it and/or
+;* FFmpeg is free software; you can redistribute it and/or
 ;* modify it under the terms of the GNU Lesser General Public
 ;* License as published by the Free Software Foundation; either
 ;* version 2.1 of the License, or (at your option) any later version.
 ;*
-;* Libav is distributed in the hope that it will be useful,
+;* FFmpeg is distributed in the hope that it will be useful,
 ;* but WITHOUT ANY WARRANTY; without even the implied warranty of
 ;* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
 ;* Lesser General Public License for more details.
 ;*
 ;* You should have received a copy of the GNU Lesser General Public
-;* License along with Libav; if not, write to the Free Software
+;* License along with FFmpeg; if not, write to the Free Software
 ;* Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
 ;******************************************************************************
 
 %include "libavutil/x86/x86util.asm"
 
-SECTION_RODATA
-
-pw_pixel_max: times 8 dw ((1 << 10)-1)
-pd_32:        times 4 dd 32
-
 SECTION .text
 
+cextern pw_1023
+%define pw_pixel_max pw_1023
+cextern pd_32
+
 ;-----------------------------------------------------------------------------
-; void h264_idct_add(pixel *dst, dctcoef *block, int stride)
+; void ff_h264_idct_add_10(pixel *dst, int16_t *block, int stride)
 ;-----------------------------------------------------------------------------
 %macro STORE_DIFFx2 6
     psrad       %1, 6
@@ -66,6 +65,10 @@ SECTION .text
     paddd m0, [pd_32]
     IDCT4_1D d,0,1,2,3,4,5
     pxor  m5, m5
+    mova [%2+ 0], m5
+    mova [%2+16], m5
+    mova [%2+32], m5
+    mova [%2+48], m5
     STORE_DIFFx2 m0, m1, m4, m5, %1, %3
     lea   %1, [%1+%3*2]
     STORE_DIFFx2 m2, m3, m4, m5, %1, %3
@@ -73,6 +76,7 @@ SECTION .text
 
 %macro IDCT_ADD_10 0
 cglobal h264_idct_add_10, 3,3
+    movsxdifnidn r2, r2d
     IDCT4_ADD_10 r0, r1, r2
     RET
 %endmacro
@@ -85,7 +89,9 @@ IDCT_ADD_10
 %endif
 
 ;-----------------------------------------------------------------------------
-; h264_idct_add16(pixel *dst, const int *block_offset, dctcoef *block, int stride, const uint8_t nnzc[6*8])
+; void ff_h264_idct_add16_10(pixel *dst, const int *block_offset,
+;                            int16_t *block, int stride,
+;                            const uint8_t nnzc[6*8])
 ;-----------------------------------------------------------------------------
 ;;;;;;; NO FATE SAMPLES TRIGGER THIS
 %macro ADD4x4IDCT 0
@@ -100,6 +106,10 @@ add4x4_idct %+ SUFFIX:
     paddd m0, [pd_32]
     IDCT4_1D d,0,1,2,3,4,5
     pxor  m5, m5
+    mova  [r2+ 0], m5
+    mova  [r2+16], m5
+    mova  [r2+32], m5
+    mova  [r2+48], m5
     STORE_DIFFx2 m0, m1, m4, m5, r5, r3
     lea   r5, [r5+r3*2]
     STORE_DIFFx2 m2, m3, m4, m5, r5, r3
@@ -128,6 +138,7 @@ ADD4x4IDCT
 
 %macro IDCT_ADD16_10 0
 cglobal h264_idct_add16_10, 5,6
+    movsxdifnidn r3, r3d
     ADD16_OP 0, 4+1*8
     ADD16_OP 1, 5+1*8
     ADD16_OP 2, 4+2*8
@@ -155,7 +166,7 @@ IDCT_ADD16_10
 %endif
 
 ;-----------------------------------------------------------------------------
-; void h264_idct_dc_add(pixel *dst, dctcoef *block, int stride)
+; void ff_h264_idct_dc_add_10(pixel *dst, int16_t *block, int stride)
 ;-----------------------------------------------------------------------------
 %macro IDCT_DC_ADD_OP_10 3
     pxor      m5, m5
@@ -186,7 +197,9 @@ IDCT_ADD16_10
 
 INIT_MMX mmxext
 cglobal h264_idct_dc_add_10,3,3
+    movsxdifnidn r2, r2d
     movd      m0, [r1]
+    mov dword [r1], 0
     paddd     m0, [pd_32]
     psrad     m0, 6
     lea       r1, [r2*3]
@@ -196,14 +209,15 @@ cglobal h264_idct_dc_add_10,3,3
     RET
 
 ;-----------------------------------------------------------------------------
-; void h264_idct8_dc_add(pixel *dst, dctcoef *block, int stride)
+; void ff_h264_idct8_dc_add_10(pixel *dst, int16_t *block, int stride)
 ;-----------------------------------------------------------------------------
 %macro IDCT8_DC_ADD 0
-cglobal h264_idct8_dc_add_10,3,3,7
-    mov      r1d, [r1]
-    add       r1, 32
-    sar       r1, 6
-    movd      m0, r1d
+cglobal h264_idct8_dc_add_10,3,4,7
+    movsxdifnidn r2, r2d
+    movd      m0, [r1]
+    mov dword[r1], 0
+    paddd     m0, [pd_32]
+    psrad     m0, 6
     lea       r1, [r2*3]
     SPLATW    m0, m0, 0
     mova      m6, [pw_pixel_max]
@@ -221,7 +235,9 @@ IDCT8_DC_ADD
 %endif
 
 ;-----------------------------------------------------------------------------
-; h264_idct_add16intra(pixel *dst, const int *block_offset, dctcoef *block, int stride, const uint8_t nnzc[6*8])
+; void ff_h264_idct_add16intra_10(pixel *dst, const int *block_offset,
+;                                 int16_t *block, int stride,
+;                                 const uint8_t nnzc[6*8])
 ;-----------------------------------------------------------------------------
 %macro AC 1
 .ac%1:
@@ -255,6 +271,8 @@ idct_dc_add %+ SUFFIX:
     add       r5, r0
     movq      m0, [r2+ 0]
     movhps    m0, [r2+64]
+    mov dword [r2+ 0], 0
+    mov dword [r2+64], 0
     paddd     m0, [pd_32]
     psrad     m0, 6
     pshufhw   m0, m0, 0
@@ -265,6 +283,7 @@ idct_dc_add %+ SUFFIX:
     ret
 
 cglobal h264_idct_add16intra_10,5,7,8
+    movsxdifnidn r3, r3d
     ADD16_OP_INTRA 0, 4+1*8
     ADD16_OP_INTRA 2, 4+2*8
     ADD16_OP_INTRA 4, 6+1*8
@@ -293,10 +312,13 @@ IDCT_ADD16INTRA_10
 
 %assign last_block 36
 ;-----------------------------------------------------------------------------
-; h264_idct_add8(pixel **dst, const int *block_offset, dctcoef *block, int stride, const uint8_t nnzc[6*8])
+; void ff_h264_idct_add8_10(pixel **dst, const int *block_offset,
+;                           int16_t *block, int stride,
+;                           const uint8_t nnzc[6*8])
 ;-----------------------------------------------------------------------------
 %macro IDCT_ADD8 0
 cglobal h264_idct_add8_10,5,8,7
+    movsxdifnidn r3, r3d
 %if ARCH_X86_64
     mov      r7, r0
 %endif
@@ -329,7 +351,60 @@ IDCT_ADD8
 %endif
 
 ;-----------------------------------------------------------------------------
-; void h264_idct8_add(pixel *dst, dctcoef *block, int stride)
+; void ff_h264_idct_add8_422_10(pixel **dst, const int *block_offset,
+;                               int16_t *block, int stride,
+;                               const uint8_t nnzc[6*8])
+;-----------------------------------------------------------------------------
+%assign last_block 44
+
+%macro IDCT_ADD8_422 0
+
+cglobal h264_idct_add8_422_10, 5, 8, 7
+    movsxdifnidn r3, r3d
+%if ARCH_X86_64
+    mov      r7, r0
+%endif
+
+    add      r2, 1024
+    mov      r0, [r0]
+    ADD16_OP_INTRA 16, 4+ 6*8
+    ADD16_OP_INTRA 18, 4+ 7*8
+    ADD16_OP_INTRA 24, 4+ 8*8 ; i+4
+    ADD16_OP_INTRA 26, 4+ 9*8 ; i+4
+    add      r2, 1024-128*4
+
+%if ARCH_X86_64
+    mov      r0, [r7+gprsize]
+%else
+    mov      r0, r0m
+    mov      r0, [r0+gprsize]
+%endif
+
+    ADD16_OP_INTRA 32, 4+11*8
+    ADD16_OP_INTRA 34, 4+12*8
+    ADD16_OP_INTRA 40, 4+13*8 ; i+4
+    ADD16_OP_INTRA 42, 4+14*8 ; i+4
+REP_RET
+    AC 16
+    AC 18
+    AC 24 ; i+4
+    AC 26 ; i+4
+    AC 32
+    AC 34
+    AC 40 ; i+4
+    AC 42 ; i+4
+
+%endmacro
+
+INIT_XMM sse2
+IDCT_ADD8_422
+%if HAVE_AVX_EXTERNAL
+INIT_XMM avx
+IDCT_ADD8_422
+%endif
+
+;-----------------------------------------------------------------------------
+; void ff_h264_idct8_add_10(pixel *dst, int16_t *block, int stride)
 ;-----------------------------------------------------------------------------
 %macro IDCT8_1D 2
     SWAP      0, 1
@@ -433,6 +508,7 @@ IDCT_ADD8
 
 %macro IDCT8_ADD 0
 cglobal h264_idct8_add_10, 3,4,16
+    movsxdifnidn r2, r2d
 %if UNIX64 == 0
     %assign pad 16-gprsize-(stack_offset&15)
     sub  rsp, pad
@@ -473,6 +549,22 @@ h264_idct8_add1_10 %+ SUFFIX:
     packssdw      m8, m0
     paddsw        m8, [r0]
     pxor          m0, m0
+    mova    [r1+  0], m0
+    mova    [r1+ 16], m0
+    mova    [r1+ 32], m0
+    mova    [r1+ 48], m0
+    mova    [r1+ 64], m0
+    mova    [r1+ 80], m0
+    mova    [r1+ 96], m0
+    mova    [r1+112], m0
+    mova    [r1+128], m0
+    mova    [r1+144], m0
+    mova    [r1+160], m0
+    mova    [r1+176], m0
+    mova    [r1+192], m0
+    mova    [r1+208], m0
+    mova    [r1+224], m0
+    mova    [r1+240], m0
     CLIPW         m8, m0, [pw_pixel_max]
     mova        [r0], m8
     mova          m8, [pw_pixel_max]
@@ -492,6 +584,22 @@ h264_idct8_add1_10 %+ SUFFIX:
     lea           r3, [r0+8]
     IDCT8_ADD_SSE_END r0, rsp,    r2
     IDCT8_ADD_SSE_END r3, rsp+16, r2
+    mova    [r1+  0], m7
+    mova    [r1+ 16], m7
+    mova    [r1+ 32], m7
+    mova    [r1+ 48], m7
+    mova    [r1+ 64], m7
+    mova    [r1+ 80], m7
+    mova    [r1+ 96], m7
+    mova    [r1+112], m7
+    mova    [r1+128], m7
+    mova    [r1+144], m7
+    mova    [r1+160], m7
+    mova    [r1+176], m7
+    mova    [r1+192], m7
+    mova    [r1+208], m7
+    mova    [r1+224], m7
+    mova    [r1+240], m7
 %endif ; ARCH_X86_64
 
     add          rsp, pad
@@ -506,7 +614,9 @@ IDCT8_ADD
 %endif
 
 ;-----------------------------------------------------------------------------
-; h264_idct8_add4(pixel **dst, const int *block_offset, dctcoef *block, int stride, const uint8_t nnzc[6*8])
+; void ff_h264_idct8_add4_10(pixel **dst, const int *block_offset,
+;                            int16_t *block, int stride,
+;                            const uint8_t nnzc[6*8])
 ;-----------------------------------------------------------------------------
 ;;;;;;; NO FATE SAMPLES TRIGGER THIS
 %macro IDCT8_ADD4_OP 2
@@ -523,6 +633,7 @@ IDCT8_ADD
 
 %macro IDCT8_ADD4 0
 cglobal h264_idct8_add4_10, 0,7,16
+    movsxdifnidn r3, r3d
     %assign pad 16-gprsize-(stack_offset&15)
     SUB      rsp, pad
     mov       r5, r0mp

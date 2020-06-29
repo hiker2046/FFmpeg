@@ -44,7 +44,6 @@
 
 /** decoder context */
 typedef struct EightSvxContext {
-    AVFrame frame;
     uint8_t fib_acc[2];
     const int8_t *table;
 
@@ -88,6 +87,7 @@ static int eightsvx_decode_frame(AVCodecContext *avctx, void *data,
                                  int *got_frame_ptr, AVPacket *avpkt)
 {
     EightSvxContext *esc = avctx->priv_data;
+    AVFrame *frame       = data;
     int buf_size;
     int ch, ret;
     int hdr_size = 2;
@@ -101,7 +101,7 @@ static int eightsvx_decode_frame(AVCodecContext *avctx, void *data,
         }
         if (avpkt->size < (hdr_size + 1) * avctx->channels) {
             av_log(avctx, AV_LOG_ERROR, "packet size is too small\n");
-            return AVERROR(EINVAL);
+            return AVERROR_INVALIDDATA;
         }
 
         esc->fib_acc[0] = avpkt->data[1] + 128;
@@ -124,7 +124,7 @@ static int eightsvx_decode_frame(AVCodecContext *avctx, void *data,
     }
     if (!esc->data[0]) {
         av_log(avctx, AV_LOG_ERROR, "unexpected empty packet\n");
-        return AVERROR(EINVAL);
+        return AVERROR_INVALIDDATA;
     }
 
     /* decode next piece of data from the buffer */
@@ -135,21 +135,18 @@ static int eightsvx_decode_frame(AVCodecContext *avctx, void *data,
     }
 
     /* get output buffer */
-    esc->frame.nb_samples = buf_size * 2;
-    if ((ret = ff_get_buffer(avctx, &esc->frame)) < 0) {
-        av_log(avctx, AV_LOG_ERROR, "get_buffer() failed\n");
+    frame->nb_samples = buf_size * 2;
+    if ((ret = ff_get_buffer(avctx, frame, 0)) < 0)
         return ret;
-    }
 
     for (ch = 0; ch < avctx->channels; ch++) {
-        delta_decode(esc->frame.data[ch], &esc->data[ch][esc->data_idx],
+        delta_decode(frame->data[ch], &esc->data[ch][esc->data_idx],
                      buf_size, &esc->fib_acc[ch], esc->table);
     }
 
     esc->data_idx += buf_size;
 
-    *got_frame_ptr   = 1;
-    *(AVFrame *)data = esc->frame;
+    *got_frame_ptr = 1;
 
     return ((avctx->frame_number == 0)*hdr_size + buf_size)*avctx->channels;
 }
@@ -167,13 +164,9 @@ static av_cold int eightsvx_decode_init(AVCodecContext *avctx)
     case AV_CODEC_ID_8SVX_FIB: esc->table = fibonacci;    break;
     case AV_CODEC_ID_8SVX_EXP: esc->table = exponential;  break;
     default:
-        av_log(avctx, AV_LOG_ERROR, "Invalid codec id %d.\n", avctx->codec->id);
-        return AVERROR_INVALIDDATA;
+        av_assert1(0);
     }
     avctx->sample_fmt = AV_SAMPLE_FMT_U8P;
-
-    avcodec_get_frame_defaults(&esc->frame);
-    avctx->coded_frame = &esc->frame;
 
     return 0;
 }
@@ -193,14 +186,14 @@ static av_cold int eightsvx_decode_close(AVCodecContext *avctx)
 #if CONFIG_EIGHTSVX_FIB_DECODER
 AVCodec ff_eightsvx_fib_decoder = {
   .name           = "8svx_fib",
+  .long_name      = NULL_IF_CONFIG_SMALL("8SVX fibonacci"),
   .type           = AVMEDIA_TYPE_AUDIO,
   .id             = AV_CODEC_ID_8SVX_FIB,
   .priv_data_size = sizeof (EightSvxContext),
   .init           = eightsvx_decode_init,
   .decode         = eightsvx_decode_frame,
   .close          = eightsvx_decode_close,
-  .capabilities   = CODEC_CAP_DR1,
-  .long_name      = NULL_IF_CONFIG_SMALL("8SVX fibonacci"),
+  .capabilities   = AV_CODEC_CAP_DR1,
   .sample_fmts    = (const enum AVSampleFormat[]) { AV_SAMPLE_FMT_U8P,
                                                     AV_SAMPLE_FMT_NONE },
 };
@@ -208,14 +201,14 @@ AVCodec ff_eightsvx_fib_decoder = {
 #if CONFIG_EIGHTSVX_EXP_DECODER
 AVCodec ff_eightsvx_exp_decoder = {
   .name           = "8svx_exp",
+  .long_name      = NULL_IF_CONFIG_SMALL("8SVX exponential"),
   .type           = AVMEDIA_TYPE_AUDIO,
   .id             = AV_CODEC_ID_8SVX_EXP,
   .priv_data_size = sizeof (EightSvxContext),
   .init           = eightsvx_decode_init,
   .decode         = eightsvx_decode_frame,
   .close          = eightsvx_decode_close,
-  .capabilities   = CODEC_CAP_DR1,
-  .long_name      = NULL_IF_CONFIG_SMALL("8SVX exponential"),
+  .capabilities   = AV_CODEC_CAP_DR1,
   .sample_fmts    = (const enum AVSampleFormat[]) { AV_SAMPLE_FMT_U8P,
                                                     AV_SAMPLE_FMT_NONE },
 };

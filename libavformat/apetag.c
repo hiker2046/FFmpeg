@@ -20,13 +20,17 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <inttypes.h>
+
 #include "libavutil/intreadwrite.h"
 #include "libavutil/dict.h"
 #include "avformat.h"
+#include "avio_internal.h"
 #include "apetag.h"
 #include "internal.h"
 
-#define APE_TAG_FLAG_CONTAINS_HEADER  (1 << 31)
+#define APE_TAG_FLAG_CONTAINS_HEADER  (1U << 31)
+#define APE_TAG_FLAG_LACKS_FOOTER     (1 << 30)
 #define APE_TAG_FLAG_IS_HEADER        (1 << 29)
 #define APE_TAG_FLAG_IS_BINARY        (1 << 1)
 
@@ -34,7 +38,7 @@ static int ape_tag_read_field(AVFormatContext *s)
 {
     AVIOContext *pb = s->pb;
     uint8_t key[1024], *value;
-    uint32_t size, flags;
+    int64_t size, flags;
     int i, c;
 
     size = avio_rl32(pb);  /* field size */
@@ -51,20 +55,26 @@ static int ape_tag_read_field(AVFormatContext *s)
         av_log(s, AV_LOG_WARNING, "Invalid APE tag key '%s'.\n", key);
         return -1;
     }
-    if (size >= UINT_MAX)
-        return -1;
+    if (size > INT32_MAX - AV_INPUT_BUFFER_PADDING_SIZE) {
+        av_log(s, AV_LOG_ERROR, "APE tag size too large.\n");
+        return AVERROR_INVALIDDATA;
+    }
     if (flags & APE_TAG_FLAG_IS_BINARY) {
         uint8_t filename[1024];
         enum AVCodecID id;
+        int ret;
         AVStream *st = avformat_new_stream(s, NULL);
         if (!st)
             return AVERROR(ENOMEM);
 
-        size -= avio_get_str(pb, size, filename, sizeof(filename));
-        if (size <= 0) {
+        ret = avio_get_str(pb, size, filename, sizeof(filename));
+        if (ret < 0)
+            return ret;
+        if (size <= ret) {
             av_log(s, AV_LOG_WARNING, "Skipping binary tag '%s'.\n", key);
             return 0;
         }
+        size -= ret;
 
         av_dict_set(&st->metadata, key, filename, 0);
 
@@ -79,22 +89,16 @@ static int ape_tag_read_field(AVFormatContext *s)
             }
 
             st->disposition      |= AV_DISPOSITION_ATTACHED_PIC;
-            st->codec->codec_type = AVMEDIA_TYPE_VIDEO;
-            st->codec->codec_id   = id;
+            st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+            st->codecpar->codec_id   = id;
 
             st->attached_pic              = pkt;
             st->attached_pic.stream_index = st->index;
             st->attached_pic.flags       |= AV_PKT_FLAG_KEY;
         } else {
-            st->codec->extradata = av_malloc(size + FF_INPUT_BUFFER_PADDING_SIZE);
-            if (!st->codec->extradata)
-                return AVERROR(ENOMEM);
-            if (avio_read(pb, st->codec->extradata, size) != size) {
-                av_freep(&st->codec->extradata);
-                return AVERROR(EIO);
-            }
-            st->codec->extradata_size = size;
-            st->codec->codec_type = AVMEDIA_TYPE_ATTACHMENT;
+            if ((ret = ff_get_extradata(s, st->codecpar, s->pb, size)) < 0)
+                return ret;
+            st->codecpar->codec_type = AVMEDIA_TYPE_ATTACHMENT;
         }
     } else {
         value = av_malloc(size+1);
@@ -114,7 +118,7 @@ static int ape_tag_read_field(AVFormatContext *s)
 int64_t ff_ape_parse_tag(AVFormatContext *s)
 {
     AVIOContext *pb = s->pb;
-    int file_size = avio_size(pb);
+    int64_t file_size = avio_size(pb);
     uint32_t val, fields, tag_bytes;
     uint8_t buf[8];
     int64_t tag_start;
@@ -143,14 +147,13 @@ int64_t ff_ape_parse_tag(AVFormatContext *s)
     }
 
     if (tag_bytes > file_size - APE_TAG_FOOTER_BYTES) {
-        av_log(s, AV_LOG_ERROR, "Invalid tag size %u.\n", tag_bytes);
+        av_log(s, AV_LOG_ERROR, "Invalid tag size %"PRIu32".\n", tag_bytes);
         return 0;
     }
-    tag_start = file_size - tag_bytes - APE_TAG_FOOTER_BYTES;
 
     fields = avio_rl32(pb);    /* number of fields */
     if (fields > 65536) {
-        av_log(s, AV_LOG_ERROR, "Too many tag fields (%d)\n", fields);
+        av_log(s, AV_LOG_ERROR, "Too many tag fields (%"PRIu32")\n", fields);
         return 0;
     }
 
@@ -162,8 +165,81 @@ int64_t ff_ape_parse_tag(AVFormatContext *s)
 
     avio_seek(pb, file_size - tag_bytes, SEEK_SET);
 
+    if (val & APE_TAG_FLAG_CONTAINS_HEADER)
+        tag_bytes += APE_TAG_HEADER_BYTES;
+
+    tag_start = file_size - tag_bytes;
+
     for (i=0; i<fields; i++)
         if (ape_tag_read_field(s) < 0) break;
 
     return tag_start;
+}
+
+static int string_is_ascii(const uint8_t *str)
+{
+    while (*str && *str >= 0x20 && *str <= 0x7e ) str++;
+    return !*str;
+}
+
+int ff_ape_write_tag(AVFormatContext *s)
+{
+    AVDictionaryEntry *e = NULL;
+    int size, ret, count = 0;
+    AVIOContext *dyn_bc;
+    uint8_t *dyn_buf;
+
+    if ((ret = avio_open_dyn_buf(&dyn_bc)) < 0)
+        return ret;
+
+    ff_standardize_creation_time(s);
+    while ((e = av_dict_get(s->metadata, "", e, AV_DICT_IGNORE_SUFFIX))) {
+        int val_len;
+
+        if (!string_is_ascii(e->key)) {
+            av_log(s, AV_LOG_WARNING, "Non ASCII keys are not allowed\n");
+            continue;
+        }
+
+        val_len = strlen(e->value);
+        avio_wl32(dyn_bc, val_len);            // value length
+        avio_wl32(dyn_bc, 0);                  // item flags
+        avio_put_str(dyn_bc, e->key);          // key
+        avio_write(dyn_bc, e->value, val_len); // value
+        count++;
+    }
+    if (!count)
+        goto end;
+
+    size = avio_get_dyn_buf(dyn_bc, &dyn_buf);
+    if (size <= 0)
+        goto end;
+    size += APE_TAG_FOOTER_BYTES;
+
+    // header
+    avio_write(s->pb, "APETAGEX", 8);   // id
+    avio_wl32(s->pb, APE_TAG_VERSION);  // version
+    avio_wl32(s->pb, size);
+    avio_wl32(s->pb, count);
+
+    // flags
+    avio_wl32(s->pb, APE_TAG_FLAG_CONTAINS_HEADER | APE_TAG_FLAG_IS_HEADER);
+    ffio_fill(s->pb, 0, 8);             // reserved
+
+    avio_write(s->pb, dyn_buf, size - APE_TAG_FOOTER_BYTES);
+
+    // footer
+    avio_write(s->pb, "APETAGEX", 8);   // id
+    avio_wl32(s->pb, APE_TAG_VERSION);  // version
+    avio_wl32(s->pb, size);             // size
+    avio_wl32(s->pb, count);            // tag count
+
+    // flags
+    avio_wl32(s->pb, APE_TAG_FLAG_CONTAINS_HEADER);
+    ffio_fill(s->pb, 0, 8);             // reserved
+
+end:
+    ffio_free_dyn_buf(&dyn_bc);
+
+    return ret;
 }

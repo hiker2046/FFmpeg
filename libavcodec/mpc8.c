@@ -29,7 +29,6 @@
 #include "libavutil/lfg.h"
 #include "avcodec.h"
 #include "get_bits.h"
-#include "dsputil.h"
 #include "internal.h"
 #include "mpegaudiodsp.h"
 
@@ -63,7 +62,7 @@ static inline int mpc8_dec_enum(GetBitContext *gb, int k, int n)
     do {
         n--;
         if (code >= C[n]) {
-            bits |= 1 << n;
+            bits |= 1U << n;
             code -= C[n];
             C -= 32;
             k--;
@@ -119,7 +118,6 @@ static av_cold int mpc8_decode_init(AVCodecContext * avctx)
     }
     memset(c->oldDSCF, 0, sizeof(c->oldDSCF));
     av_lfg_init(&c->rnd, 0xDEADBEEF);
-    ff_dsputil_init(&c->dsp, avctx);
     ff_mpadsp_init(&c->mpadsp);
 
     ff_mpc_init();
@@ -134,7 +132,7 @@ static av_cold int mpc8_decode_init(AVCodecContext * avctx)
     }
     channels = get_bits(&gb, 4) + 1;
     if (channels > 2) {
-        av_log_missing_feature(avctx, "Multichannel MPC SV8", 1);
+        avpriv_request_sample(avctx, "Multichannel MPC SV8");
         return AVERROR_PATCHWELCOME;
     }
     c->MSS = get_bits1(&gb);
@@ -143,9 +141,6 @@ static av_cold int mpc8_decode_init(AVCodecContext * avctx)
     avctx->sample_fmt = AV_SAMPLE_FMT_S16P;
     avctx->channel_layout = (channels==2) ? AV_CH_LAYOUT_STEREO : AV_CH_LAYOUT_MONO;
     avctx->channels = channels;
-
-    avcodec_get_frame_defaults(&c->frame);
-    avctx->coded_frame = &c->frame;
 
     if(vlc_initialized) return 0;
     av_log(avctx, AV_LOG_DEBUG, "Initing VLC\n");
@@ -244,6 +239,7 @@ static av_cold int mpc8_decode_init(AVCodecContext * avctx)
 static int mpc8_decode_frame(AVCodecContext * avctx, void *data,
                              int *got_frame_ptr, AVPacket *avpkt)
 {
+    AVFrame *frame     = data;
     const uint8_t *buf = avpkt->data;
     int buf_size = avpkt->size;
     MPCContext *c = avctx->priv_data;
@@ -254,20 +250,15 @@ static int mpc8_decode_frame(AVCodecContext * avctx, void *data,
     int maxband, keyframe;
     int last[2];
 
-    /* get output buffer */
-    c->frame.nb_samples = MPC_FRAME_SIZE;
-    if ((res = ff_get_buffer(avctx, &c->frame)) < 0) {
-        av_log(avctx, AV_LOG_ERROR, "get_buffer() failed\n");
-        return res;
-    }
-
     keyframe = c->cur_frame == 0;
 
     if(keyframe){
         memset(c->Q, 0, sizeof(c->Q));
         c->last_bits_used = 0;
     }
-    init_get_bits(gb, buf, buf_size * 8);
+    if ((res = init_get_bits8(gb, buf, buf_size)) < 0)
+        return res;
+
     skip_bits(gb, c->last_bits_used & 7);
 
     if(keyframe)
@@ -275,6 +266,11 @@ static int mpc8_decode_frame(AVCodecContext * avctx, void *data,
     else{
         maxband = c->last_max_band + get_vlc2(gb, band_vlc.table, MPC8_BANDS_BITS, 2);
         if(maxband > 32) maxband -= 33;
+    }
+
+    if (get_bits_left(gb) < 0) {
+        *got_frame_ptr = 0;
+        return buf_size;
     }
 
     if(maxband > c->maxbands + 1) {
@@ -368,8 +364,9 @@ static int mpc8_decode_frame(AVCodecContext * avctx, void *data,
                 for(j = 0; j < SAMPLES_PER_BAND; j += SAMPLES_PER_BAND / 2){
                     cnt = get_vlc2(gb, q1_vlc.table, MPC8_Q1_BITS, 2);
                     t = mpc8_get_mask(gb, 18, cnt);
-                    for(k = 0; k < SAMPLES_PER_BAND / 2; k++, t <<= 1)
-                        c->Q[ch][off + j + k] = (t & 0x20000) ? (get_bits1(gb) << 1) - 1 : 0;
+                    for(k = 0; k < SAMPLES_PER_BAND / 2; k++)
+                        c->Q[ch][off + j + k] = t & (1 << (SAMPLES_PER_BAND / 2 - k - 1))
+                                                ? (get_bits1(gb) << 1) - 1 : 0;
                 }
                 break;
             case 2:
@@ -414,20 +411,27 @@ static int mpc8_decode_frame(AVCodecContext * avctx, void *data,
         }
     }
 
+    frame->nb_samples = MPC_FRAME_SIZE;
+    if ((res = ff_get_buffer(avctx, frame, 0)) < 0)
+        return res;
+
     ff_mpc_dequantize_and_synth(c, maxband - 1,
-                                (int16_t **)c->frame.extended_data,
+                                (int16_t **)frame->extended_data,
                                 avctx->channels);
 
     c->cur_frame++;
 
     c->last_bits_used = get_bits_count(gb);
-    if(get_bits_left(gb) < 8) // we have only padding left
-        c->last_bits_used = buf_size << 3;
     if(c->cur_frame >= c->frames)
         c->cur_frame = 0;
+    if (get_bits_left(gb) < 0) {
+        av_log(avctx, AV_LOG_ERROR, "Overread %d\n", -get_bits_left(gb));
+        c->last_bits_used = buf_size << 3;
+    } else if (c->cur_frame == 0 && get_bits_left(gb) < 8) {// we have only padding left
+        c->last_bits_used = buf_size << 3;
+    }
 
-    *got_frame_ptr   = 1;
-    *(AVFrame *)data = c->frame;
+    *got_frame_ptr = 1;
 
     return c->cur_frame ? c->last_bits_used >> 3 : buf_size;
 }
@@ -440,14 +444,14 @@ static av_cold void mpc8_decode_flush(AVCodecContext *avctx)
 
 AVCodec ff_mpc8_decoder = {
     .name           = "mpc8",
+    .long_name      = NULL_IF_CONFIG_SMALL("Musepack SV8"),
     .type           = AVMEDIA_TYPE_AUDIO,
     .id             = AV_CODEC_ID_MUSEPACK8,
     .priv_data_size = sizeof(MPCContext),
     .init           = mpc8_decode_init,
     .decode         = mpc8_decode_frame,
     .flush          = mpc8_decode_flush,
-    .capabilities   = CODEC_CAP_DR1,
-    .long_name      = NULL_IF_CONFIG_SMALL("Musepack SV8"),
+    .capabilities   = AV_CODEC_CAP_DR1,
     .sample_fmts    = (const enum AVSampleFormat[]) { AV_SAMPLE_FMT_S16P,
                                                       AV_SAMPLE_FMT_NONE },
 };

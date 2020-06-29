@@ -31,40 +31,37 @@
 static int subviewer_event_to_ass(AVBPrint *buf, const char *p)
 {
     while (*p) {
-        char c;
-
-        if (sscanf(p, "%*u:%*u:%*u.%*u,%*u:%*u:%*u.%*u%c", &c) == 1)
-            p += strcspn(p, "\n") + 1;
         if (!strncmp(p, "[br]", 4)) {
             av_bprintf(buf, "\\N");
             p += 4;
         } else {
             if (p[0] == '\n' && p[1])
                 av_bprintf(buf, "\\N");
-            else if (*p != '\r')
+            else if (*p != '\n' && *p != '\r')
                 av_bprint_chars(buf, *p, 1);
             p++;
         }
     }
 
-    av_bprintf(buf, "\r\n");
     return 0;
 }
 
 static int subviewer_decode_frame(AVCodecContext *avctx,
                                   void *data, int *got_sub_ptr, AVPacket *avpkt)
 {
+    int ret = 0;
     AVSubtitle *sub = data;
     const char *ptr = avpkt->data;
+    FFASSDecoderContext *s = avctx->priv_data;
     AVBPrint buf;
 
     av_bprint_init(&buf, 0, AV_BPRINT_SIZE_UNLIMITED);
-    // note: no need to rescale pts & duration since they are in the same
-    // timebase as ASS (1/100)
     if (ptr && avpkt->size > 0 && !subviewer_event_to_ass(&buf, ptr))
-        ff_ass_add_rect(sub, buf.str, avpkt->pts, avpkt->duration, 0);
-    *got_sub_ptr = sub->num_rects > 0;
+        ret = ff_ass_add_rect(sub, buf.str, s->readorder++, 0, NULL, NULL);
     av_bprint_finalize(&buf, NULL);
+    if (ret < 0)
+        return ret;
+    *got_sub_ptr = sub->num_rects > 0;
     return avpkt->size;
 }
 
@@ -75,4 +72,6 @@ AVCodec ff_subviewer_decoder = {
     .id             = AV_CODEC_ID_SUBVIEWER,
     .decode         = subviewer_decode_frame,
     .init           = ff_ass_subtitle_header_default,
+    .flush          = ff_ass_decoder_flush,
+    .priv_data_size = sizeof(FFASSDecoderContext),
 };

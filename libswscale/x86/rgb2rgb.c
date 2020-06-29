@@ -27,7 +27,6 @@
 
 #include "config.h"
 #include "libavutil/attributes.h"
-#include "libavutil/x86/asm.h"
 #include "libavutil/x86/cpu.h"
 #include "libavutil/cpu.h"
 #include "libavutil/bswap.h"
@@ -76,7 +75,10 @@ DECLARE_ASM_CONST(8, uint64_t, mul15_mid)    = 0x4200420042004200ULL;
 DECLARE_ASM_CONST(8, uint64_t, mul15_hi)     = 0x0210021002100210ULL;
 DECLARE_ASM_CONST(8, uint64_t, mul16_mid)    = 0x2080208020802080ULL;
 
-#define RGB2YUV_SHIFT 8
+DECLARE_ALIGNED(8, extern const uint64_t, ff_bgr2YOffset);
+DECLARE_ALIGNED(8, extern const uint64_t, ff_w1111);
+DECLARE_ALIGNED(8, extern const uint64_t, ff_bgr2UVOffset);
+
 #define BY ((int)( 0.098*(1<<RGB2YUV_SHIFT)+0.5))
 #define BV ((int)(-0.071*(1<<RGB2YUV_SHIFT)+0.5))
 #define BU ((int)( 0.439*(1<<RGB2YUV_SHIFT)+0.5))
@@ -92,35 +94,45 @@ DECLARE_ASM_CONST(8, uint64_t, mul16_mid)    = 0x2080208020802080ULL;
 #define COMPILE_TEMPLATE_MMXEXT 0
 #define COMPILE_TEMPLATE_AMD3DNOW 0
 #define COMPILE_TEMPLATE_SSE2 0
+#define COMPILE_TEMPLATE_AVX 0
 
 //MMX versions
 #undef RENAME
-#define RENAME(a) a ## _MMX
+#define RENAME(a) a ## _mmx
 #include "rgb2rgb_template.c"
 
 // MMXEXT versions
 #undef RENAME
 #undef COMPILE_TEMPLATE_MMXEXT
 #define COMPILE_TEMPLATE_MMXEXT 1
-#define RENAME(a) a ## _MMXEXT
+#define RENAME(a) a ## _mmxext
 #include "rgb2rgb_template.c"
 
 //SSE2 versions
 #undef RENAME
 #undef COMPILE_TEMPLATE_SSE2
 #define COMPILE_TEMPLATE_SSE2 1
-#define RENAME(a) a ## _SSE2
+#define RENAME(a) a ## _sse2
+#include "rgb2rgb_template.c"
+
+//AVX versions
+#undef RENAME
+#undef COMPILE_TEMPLATE_AVX
+#define COMPILE_TEMPLATE_AVX 1
+#define RENAME(a) a ## _avx
 #include "rgb2rgb_template.c"
 
 //3DNOW versions
 #undef RENAME
 #undef COMPILE_TEMPLATE_MMXEXT
 #undef COMPILE_TEMPLATE_SSE2
+#undef COMPILE_TEMPLATE_AVX
 #undef COMPILE_TEMPLATE_AMD3DNOW
 #define COMPILE_TEMPLATE_MMXEXT 0
 #define COMPILE_TEMPLATE_SSE2 0
+#define COMPILE_TEMPLATE_AVX 0
 #define COMPILE_TEMPLATE_AMD3DNOW 1
-#define RENAME(a) a ## _3DNOW
+#define RENAME(a) a ## _3dnow
 #include "rgb2rgb_template.c"
 
 /*
@@ -132,18 +144,57 @@ DECLARE_ASM_CONST(8, uint64_t, mul16_mid)    = 0x2080208020802080ULL;
 
 #endif /* HAVE_INLINE_ASM */
 
+void ff_shuffle_bytes_2103_mmxext(const uint8_t *src, uint8_t *dst, int src_size);
+void ff_shuffle_bytes_2103_ssse3(const uint8_t *src, uint8_t *dst, int src_size);
+void ff_shuffle_bytes_0321_ssse3(const uint8_t *src, uint8_t *dst, int src_size);
+void ff_shuffle_bytes_1230_ssse3(const uint8_t *src, uint8_t *dst, int src_size);
+void ff_shuffle_bytes_3012_ssse3(const uint8_t *src, uint8_t *dst, int src_size);
+void ff_shuffle_bytes_3210_ssse3(const uint8_t *src, uint8_t *dst, int src_size);
+
+#if ARCH_X86_64
+void ff_uyvytoyuv422_sse2(uint8_t *ydst, uint8_t *udst, uint8_t *vdst,
+                          const uint8_t *src, int width, int height,
+                          int lumStride, int chromStride, int srcStride);
+void ff_uyvytoyuv422_avx(uint8_t *ydst, uint8_t *udst, uint8_t *vdst,
+                         const uint8_t *src, int width, int height,
+                         int lumStride, int chromStride, int srcStride);
+#endif
+
 av_cold void rgb2rgb_init_x86(void)
 {
-#if HAVE_INLINE_ASM
     int cpu_flags = av_get_cpu_flags();
 
+#if HAVE_INLINE_ASM
     if (INLINE_MMX(cpu_flags))
-        rgb2rgb_init_MMX();
+        rgb2rgb_init_mmx();
     if (INLINE_AMD3DNOW(cpu_flags))
-        rgb2rgb_init_3DNOW();
+        rgb2rgb_init_3dnow();
     if (INLINE_MMXEXT(cpu_flags))
-        rgb2rgb_init_MMXEXT();
+        rgb2rgb_init_mmxext();
     if (INLINE_SSE2(cpu_flags))
-        rgb2rgb_init_SSE2();
+        rgb2rgb_init_sse2();
+    if (INLINE_AVX(cpu_flags))
+        rgb2rgb_init_avx();
 #endif /* HAVE_INLINE_ASM */
+
+    if (EXTERNAL_MMXEXT(cpu_flags)) {
+        shuffle_bytes_2103 = ff_shuffle_bytes_2103_mmxext;
+    }
+    if (EXTERNAL_SSE2(cpu_flags)) {
+#if ARCH_X86_64
+        uyvytoyuv422 = ff_uyvytoyuv422_sse2;
+#endif
+    }
+    if (EXTERNAL_SSSE3(cpu_flags)) {
+        shuffle_bytes_0321 = ff_shuffle_bytes_0321_ssse3;
+        shuffle_bytes_2103 = ff_shuffle_bytes_2103_ssse3;
+        shuffle_bytes_1230 = ff_shuffle_bytes_1230_ssse3;
+        shuffle_bytes_3012 = ff_shuffle_bytes_3012_ssse3;
+        shuffle_bytes_3210 = ff_shuffle_bytes_3210_ssse3;
+    }
+    if (EXTERNAL_AVX(cpu_flags)) {
+#if ARCH_X86_64
+        uyvytoyuv422 = ff_uyvytoyuv422_avx;
+#endif
+    }
 }

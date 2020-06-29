@@ -43,14 +43,14 @@ static int rso_read_header(AVFormatContext *s)
     codec = ff_codec_get_id(ff_codec_rso_tags, id);
 
     if (codec == AV_CODEC_ID_ADPCM_IMA_WAV) {
-        av_log(s, AV_LOG_ERROR, "ADPCM in RSO not implemented\n");
+        avpriv_report_missing_feature(s, "ADPCM in RSO");
         return AVERROR_PATCHWELCOME;
     }
 
     bps = av_get_bits_per_sample(codec);
     if (!bps) {
-        av_log_ask_for_sample(s, "could not determine bits per sample\n");
-        return AVERROR_INVALIDDATA;
+        avpriv_request_sample(s, "Unknown bits per sample");
+        return AVERROR_PATCHWELCOME;
     }
 
     /* now we are ready: build format streams */
@@ -59,13 +59,13 @@ static int rso_read_header(AVFormatContext *s)
         return AVERROR(ENOMEM);
 
     st->duration            = (size * 8) / bps;
-    st->codec->codec_type   = AVMEDIA_TYPE_AUDIO;
-    st->codec->codec_tag    = id;
-    st->codec->codec_id     = codec;
-    st->codec->channels     = 1;
-    st->codec->channel_layout = AV_CH_LAYOUT_MONO;
-    st->codec->sample_rate  = rate;
-    st->codec->block_align  = 1;
+    st->codecpar->codec_type   = AVMEDIA_TYPE_AUDIO;
+    st->codecpar->codec_tag    = id;
+    st->codecpar->codec_id     = codec;
+    st->codecpar->channels     = 1;
+    st->codecpar->channel_layout = AV_CH_LAYOUT_MONO;
+    st->codecpar->sample_rate  = rate;
+    st->codecpar->block_align  = 1;
 
     avpriv_set_pts_info(st, 64, 1, rate);
 

@@ -1,6 +1,6 @@
 /*
  * Westwood Studios VQA Video Decoder
- * Copyright (C) 2003 the ffmpeg project
+ * Copyright (C) 2003 The FFmpeg project
  *
  * This file is part of FFmpeg.
  *
@@ -94,7 +94,6 @@
 typedef struct VqaContext {
 
     AVCodecContext *avctx;
-    AVFrame frame;
     GetByteContext gb;
 
     uint32_t palette[PALETTE_COUNT];
@@ -122,7 +121,7 @@ typedef struct VqaContext {
 static av_cold int vqa_decode_init(AVCodecContext *avctx)
 {
     VqaContext *s = avctx->priv_data;
-    int i, j, codebook_index;
+    int i, j, codebook_index, ret;
 
     s->avctx = avctx;
     avctx->pix_fmt = AV_PIX_FMT_PAL8;
@@ -130,20 +129,27 @@ static av_cold int vqa_decode_init(AVCodecContext *avctx)
     /* make sure the extradata made it */
     if (s->avctx->extradata_size != VQA_HEADER_SIZE) {
         av_log(s->avctx, AV_LOG_ERROR, "expected extradata size of %d\n", VQA_HEADER_SIZE);
-        return AVERROR_INVALIDDATA;
+        return AVERROR(EINVAL);
     }
 
     /* load up the VQA parameters from the header */
     s->vqa_version = s->avctx->extradata[0];
-    if (s->vqa_version < 1 || s->vqa_version > 3) {
-        av_log(s->avctx, AV_LOG_ERROR, "unsupported version %d\n", s->vqa_version);
+    switch (s->vqa_version) {
+    case 1:
+    case 2:
+        break;
+    case 3:
+        avpriv_report_missing_feature(avctx, "VQA Version %d", s->vqa_version);
+        return AVERROR_PATCHWELCOME;
+    default:
+        avpriv_request_sample(avctx, "VQA Version %i", s->vqa_version);
         return AVERROR_PATCHWELCOME;
     }
     s->width = AV_RL16(&s->avctx->extradata[6]);
     s->height = AV_RL16(&s->avctx->extradata[8]);
-    if(av_image_check_size(s->width, s->height, 0, avctx)){
+    if ((ret = ff_set_dimensions(avctx, s->width, s->height)) < 0) {
         s->width= s->height= 0;
-        return AVERROR_INVALIDDATA;
+        return ret;
     }
     s->vector_width = s->avctx->extradata[10];
     s->vector_height = s->avctx->extradata[11];
@@ -173,7 +179,7 @@ static av_cold int vqa_decode_init(AVCodecContext *avctx)
     /* allocate decode buffer */
     s->decode_buffer_size = (s->width / s->vector_width) *
         (s->height / s->vector_height) * 2;
-    s->decode_buffer = av_malloc(s->decode_buffer_size);
+    s->decode_buffer = av_mallocz(s->decode_buffer_size);
     if (!s->decode_buffer)
         goto fail;
 
@@ -190,9 +196,6 @@ static av_cold int vqa_decode_init(AVCodecContext *avctx)
                 s->codebook[codebook_index++] = i;
     }
     s->next_codebook_buffer_index = 0;
-
-    avcodec_get_frame_defaults(&s->frame);
-    s->frame.data[0] = NULL;
 
     return 0;
 fail:
@@ -228,14 +231,20 @@ static int decode_format80(VqaContext *s, int src_size,
     unsigned char color;
     int i;
 
+    if (src_size < 0 || src_size > bytestream2_get_bytes_left(&s->gb)) {
+        av_log(s->avctx, AV_LOG_ERROR, "Chunk size %d is out of range\n",
+               src_size);
+        return AVERROR_INVALIDDATA;
+    }
+
     start = bytestream2_tell(&s->gb);
     while (bytestream2_tell(&s->gb) - start < src_size) {
         opcode = bytestream2_get_byte(&s->gb);
-        av_dlog(s->avctx, "opcode %02X: ", opcode);
+        ff_tlog(s->avctx, "opcode %02X: ", opcode);
 
         /* 0x80 means that frame is finished */
         if (opcode == 0x80)
-            return 0;
+            break;
 
         if (dest_index >= dest_size) {
             av_log(s->avctx, AV_LOG_ERROR, "decode_format80 problem: dest_index (%d) exceeded dest_size (%d)\n",
@@ -247,7 +256,7 @@ static int decode_format80(VqaContext *s, int src_size,
 
             count   = bytestream2_get_le16(&s->gb);
             src_pos = bytestream2_get_le16(&s->gb);
-            av_dlog(s->avctx, "(1) copy %X bytes from absolute pos %X\n", count, src_pos);
+            ff_tlog(s->avctx, "(1) copy %X bytes from absolute pos %X\n", count, src_pos);
             CHECK_COUNT();
             CHECK_COPY(src_pos);
             for (i = 0; i < count; i++)
@@ -258,7 +267,7 @@ static int decode_format80(VqaContext *s, int src_size,
 
             count = bytestream2_get_le16(&s->gb);
             color = bytestream2_get_byte(&s->gb);
-            av_dlog(s->avctx, "(2) set %X bytes to %02X\n", count, color);
+            ff_tlog(s->avctx, "(2) set %X bytes to %02X\n", count, color);
             CHECK_COUNT();
             memset(&dest[dest_index], color, count);
             dest_index += count;
@@ -267,7 +276,7 @@ static int decode_format80(VqaContext *s, int src_size,
 
             count = (opcode & 0x3F) + 3;
             src_pos = bytestream2_get_le16(&s->gb);
-            av_dlog(s->avctx, "(3) copy %X bytes from absolute pos %X\n", count, src_pos);
+            ff_tlog(s->avctx, "(3) copy %X bytes from absolute pos %X\n", count, src_pos);
             CHECK_COUNT();
             CHECK_COPY(src_pos);
             for (i = 0; i < count; i++)
@@ -277,7 +286,7 @@ static int decode_format80(VqaContext *s, int src_size,
         } else if (opcode > 0x80) {
 
             count = opcode & 0x3F;
-            av_dlog(s->avctx, "(4) copy %X bytes from source to dest\n", count);
+            ff_tlog(s->avctx, "(4) copy %X bytes from source to dest\n", count);
             CHECK_COUNT();
             bytestream2_get_buffer(&s->gb, &dest[dest_index], count);
             dest_index += count;
@@ -286,7 +295,7 @@ static int decode_format80(VqaContext *s, int src_size,
 
             count = ((opcode & 0x70) >> 4) + 3;
             src_pos = bytestream2_get_byte(&s->gb) | ((opcode & 0x0F) << 8);
-            av_dlog(s->avctx, "(5) copy %X bytes from relpos %X\n", count, src_pos);
+            ff_tlog(s->avctx, "(5) copy %X bytes from relpos %X\n", count, src_pos);
             CHECK_COUNT();
             CHECK_COPY(dest_index - src_pos);
             for (i = 0; i < count; i++)
@@ -300,14 +309,16 @@ static int decode_format80(VqaContext *s, int src_size,
      * codebook entry; it is not important for compressed codebooks because
      * not every entry needs to be filled */
     if (check_size)
-        if (dest_index < dest_size)
+        if (dest_index < dest_size) {
             av_log(s->avctx, AV_LOG_ERROR, "decode_format80 problem: decode finished with dest_index (%d) < dest_size (%d)\n",
                 dest_index, dest_size);
+            memset(dest + dest_index, 0, dest_size - dest_index);
+        }
 
     return 0; // let's display what we decoded anyway
 }
 
-static int vqa_decode_chunk(VqaContext *s)
+static int vqa_decode_chunk(VqaContext *s, AVFrame *frame)
 {
     unsigned int chunk_type;
     unsigned int chunk_size;
@@ -373,12 +384,8 @@ static int vqa_decode_chunk(VqaContext *s)
             break;
 
         default:
-            av_log(s->avctx, AV_LOG_ERROR, "Found unknown chunk type: %c%c%c%c (%08X)\n",
-            (chunk_type >> 24) & 0xFF,
-            (chunk_type >> 16) & 0xFF,
-            (chunk_type >>  8) & 0xFF,
-            (chunk_type >>  0) & 0xFF,
-            chunk_type);
+            av_log(s->avctx, AV_LOG_ERROR, "Found unknown chunk type: %s (%08X)\n",
+                   av_fourcc2str(av_bswap32(chunk_type)), chunk_type);
             break;
         }
 
@@ -476,7 +483,7 @@ static int vqa_decode_chunk(VqaContext *s)
         index_shift = 3;
     for (y = 0; y < s->height; y += s->vector_height) {
         for (x = 0; x < s->width; x += 4, lobytes++, hibytes++) {
-            pixel_ptr = y * s->frame.linesize[0] + x;
+            pixel_ptr = y * frame->linesize[0] + x;
 
             /* get the vector index, the method for which varies according to
              * VQA file version */
@@ -491,11 +498,11 @@ static int vqa_decode_chunk(VqaContext *s)
                 /* uniform color fill - a quick hack */
                 if (hibyte == 0xFF) {
                     while (lines--) {
-                        s->frame.data[0][pixel_ptr + 0] = 255 - lobyte;
-                        s->frame.data[0][pixel_ptr + 1] = 255 - lobyte;
-                        s->frame.data[0][pixel_ptr + 2] = 255 - lobyte;
-                        s->frame.data[0][pixel_ptr + 3] = 255 - lobyte;
-                        pixel_ptr += s->frame.linesize[0];
+                        frame->data[0][pixel_ptr + 0] = 255 - lobyte;
+                        frame->data[0][pixel_ptr + 1] = 255 - lobyte;
+                        frame->data[0][pixel_ptr + 2] = 255 - lobyte;
+                        frame->data[0][pixel_ptr + 3] = 255 - lobyte;
+                        pixel_ptr += frame->linesize[0];
                     }
                     lines=0;
                 }
@@ -516,11 +523,11 @@ static int vqa_decode_chunk(VqaContext *s)
             }
 
             while (lines--) {
-                s->frame.data[0][pixel_ptr + 0] = s->codebook[vector_index++];
-                s->frame.data[0][pixel_ptr + 1] = s->codebook[vector_index++];
-                s->frame.data[0][pixel_ptr + 2] = s->codebook[vector_index++];
-                s->frame.data[0][pixel_ptr + 3] = s->codebook[vector_index++];
-                pixel_ptr += s->frame.linesize[0];
+                frame->data[0][pixel_ptr + 0] = s->codebook[vector_index++];
+                frame->data[0][pixel_ptr + 1] = s->codebook[vector_index++];
+                frame->data[0][pixel_ptr + 2] = s->codebook[vector_index++];
+                frame->data[0][pixel_ptr + 3] = s->codebook[vector_index++];
+                pixel_ptr += frame->linesize[0];
             }
         }
     }
@@ -536,6 +543,12 @@ static int vqa_decode_chunk(VqaContext *s)
 
         bytestream2_seek(&s->gb, cbp0_chunk, SEEK_SET);
         chunk_size = bytestream2_get_be32(&s->gb);
+
+        if (chunk_size > MAX_CODEBOOK_SIZE - s->next_codebook_buffer_index) {
+            av_log(s->avctx, AV_LOG_ERROR, "cbp0 chunk too large (%u bytes)\n",
+                   chunk_size);
+            return AVERROR_INVALIDDATA;
+        }
 
         /* accumulate partial codebook */
         bytestream2_get_buffer(&s->gb, &s->next_codebook_buffer[s->next_codebook_buffer_index],
@@ -559,6 +572,12 @@ static int vqa_decode_chunk(VqaContext *s)
 
         bytestream2_seek(&s->gb, cbpz_chunk, SEEK_SET);
         chunk_size = bytestream2_get_be32(&s->gb);
+
+        if (chunk_size > MAX_CODEBOOK_SIZE - s->next_codebook_buffer_index) {
+            av_log(s->avctx, AV_LOG_ERROR, "cbpz chunk too large (%u bytes)\n",
+                   chunk_size);
+            return AVERROR_INVALIDDATA;
+        }
 
         /* accumulate partial codebook */
         bytestream2_get_buffer(&s->gb, &s->next_codebook_buffer[s->next_codebook_buffer_index],
@@ -587,26 +606,21 @@ static int vqa_decode_frame(AVCodecContext *avctx,
                             AVPacket *avpkt)
 {
     VqaContext *s = avctx->priv_data;
+    AVFrame *frame = data;
     int res;
 
-    if (s->frame.data[0])
-        avctx->release_buffer(avctx, &s->frame);
-
-    if ((res = ff_get_buffer(avctx, &s->frame))) {
-        av_log(s->avctx, AV_LOG_ERROR, "get_buffer() failed\n");
+    if ((res = ff_get_buffer(avctx, frame, 0)) < 0)
         return res;
-    }
 
     bytestream2_init(&s->gb, avpkt->data, avpkt->size);
-    if ((res = vqa_decode_chunk(s)) < 0)
+    if ((res = vqa_decode_chunk(s, frame)) < 0)
         return res;
 
     /* make the palette available on the way out */
-    memcpy(s->frame.data[1], s->palette, PALETTE_COUNT * 4);
-    s->frame.palette_has_changed = 1;
+    memcpy(frame->data[1], s->palette, PALETTE_COUNT * 4);
+    frame->palette_has_changed = 1;
 
     *got_frame      = 1;
-    *(AVFrame*)data = s->frame;
 
     /* report that the buffer was completely consumed */
     return avpkt->size;
@@ -620,20 +634,23 @@ static av_cold int vqa_decode_end(AVCodecContext *avctx)
     av_freep(&s->next_codebook_buffer);
     av_freep(&s->decode_buffer);
 
-    if (s->frame.data[0])
-        avctx->release_buffer(avctx, &s->frame);
-
     return 0;
 }
 
+static const AVCodecDefault vqa_defaults[] = {
+    { "max_pixels", "320*240" },
+    { NULL },
+};
+
 AVCodec ff_vqa_decoder = {
     .name           = "vqavideo",
+    .long_name      = NULL_IF_CONFIG_SMALL("Westwood Studios VQA (Vector Quantized Animation) video"),
     .type           = AVMEDIA_TYPE_VIDEO,
     .id             = AV_CODEC_ID_WS_VQA,
     .priv_data_size = sizeof(VqaContext),
     .init           = vqa_decode_init,
     .close          = vqa_decode_end,
     .decode         = vqa_decode_frame,
-    .capabilities   = CODEC_CAP_DR1,
-    .long_name      = NULL_IF_CONFIG_SMALL("Westwood Studios VQA (Vector Quantized Animation) video"),
+    .capabilities   = AV_CODEC_CAP_DR1,
+    .defaults       = vqa_defaults,
 };

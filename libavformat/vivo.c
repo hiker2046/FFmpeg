@@ -36,11 +36,12 @@ typedef struct VivoContext {
     int type;
     int sequence;
     int length;
+    int duration;
 
     uint8_t  text[1024 + 1];
 } VivoContext;
 
-static int vivo_probe(AVProbeData *p)
+static int vivo_probe(const AVProbeData *p)
 {
     const unsigned char *buf = p->buf;
     unsigned c, length = 0;
@@ -59,11 +60,12 @@ static int vivo_probe(AVProbeData *p)
     if (c & 0x80 || length > 1024 || length < 21)
         return 0;
 
-    if (memcmp(buf, "\r\nVersion:Vivo/", 15))
+    buf += 2;
+    if (memcmp(buf, "Version:Vivo/", 13))
         return 0;
-    buf += 15;
+    buf += 13;
 
-    if (*buf < '0' && *buf > '2')
+    if (*buf < '0' || *buf > '2')
         return 0;
 
     return AVPROBE_SCORE_MAX;
@@ -75,7 +77,7 @@ static int vivo_get_packet_header(AVFormatContext *s)
     AVIOContext *pb = s->pb;
     unsigned c, get_length = 0;
 
-    if (url_feof(pb))
+    if (avio_feof(pb))
         return AVERROR_EOF;
 
     c = avio_r8(pb);
@@ -131,7 +133,7 @@ static int vivo_read_header(AVFormatContext *s)
     if (!ast || !vst)
         return AVERROR(ENOMEM);
 
-    ast->codec->sample_rate = 8000;
+    ast->codecpar->sample_rate = 8000;
 
     while (1) {
         if ((ret = vivo_get_packet_header(s)) < 0)
@@ -166,7 +168,7 @@ static int vivo_read_header(AVFormatContext *s)
             value = strchr(key, ':');
             if (!value) {
                 av_log(s, AV_LOG_WARNING, "missing colon in key:value pair '%s'\n",
-                       value);
+                       key);
                 continue;
             }
 
@@ -182,15 +184,15 @@ static int vivo_read_header(AVFormatContext *s)
                 if (!strcmp(key, "Duration")) {
                     duration = value_int;
                 } else if (!strcmp(key, "Width")) {
-                    vst->codec->width = value_int;
+                    vst->codecpar->width = value_int;
                 } else if (!strcmp(key, "Height")) {
-                    vst->codec->height = value_int;
+                    vst->codecpar->height = value_int;
                 } else if (!strcmp(key, "TimeUnitNumerator")) {
                     fps.num = value_int / 1000;
                 } else if (!strcmp(key, "TimeUnitDenominator")) {
                     fps.den = value_int;
                 } else if (!strcmp(key, "SamplingFrequency")) {
-                    ast->codec->sample_rate = value_int;
+                    ast->codecpar->sample_rate = value_int;
                 } else if (!strcmp(key, "NominalBitrate")) {
                 } else if (!strcmp(key, "Length")) {
                     // size of file
@@ -216,27 +218,33 @@ static int vivo_read_header(AVFormatContext *s)
         }
     }
 
-    avpriv_set_pts_info(ast, 64, 1, ast->codec->sample_rate);
+    avpriv_set_pts_info(ast, 64, 1, ast->codecpar->sample_rate);
     avpriv_set_pts_info(vst, 64, fps.num, fps.den);
     if (duration)
         s->duration = av_rescale(duration, 1000, 1);
 
     vst->start_time        = 0;
-    vst->codec->codec_tag  = 0;
-    vst->codec->codec_type = AVMEDIA_TYPE_VIDEO;
+    vst->codecpar->codec_tag  = 0;
+    vst->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
 
     if (vivo->version == 1) {
-        vst->codec->codec_id = AV_CODEC_ID_H263;
-        ast->codec->codec_id = AV_CODEC_ID_G723_1;
-        ast->codec->bits_per_coded_sample = 8;
-        ast->codec->block_align = 24;
-        ast->codec->bit_rate = 6400;
+        vst->codecpar->codec_id = AV_CODEC_ID_H263;
+        ast->codecpar->codec_id = AV_CODEC_ID_G723_1;
+        ast->codecpar->bits_per_coded_sample = 8;
+        ast->codecpar->block_align = 24;
+        ast->codecpar->bit_rate = 6400;
+    } else {
+        ast->codecpar->codec_id = AV_CODEC_ID_SIREN;
+        ast->codecpar->bits_per_coded_sample = 16;
+        ast->codecpar->block_align = 40;
+        ast->codecpar->bit_rate = 6400;
+        vivo->duration = 320;
     }
 
     ast->start_time        = 0;
-    ast->codec->codec_tag  = 0;
-    ast->codec->codec_type = AVMEDIA_TYPE_AUDIO;
-    ast->codec->channels = 1;
+    ast->codecpar->codec_tag  = 0;
+    ast->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
+    ast->codecpar->channels = 1;
 
     return 0;
 }
@@ -246,11 +254,11 @@ static int vivo_read_packet(AVFormatContext *s, AVPacket *pkt)
     VivoContext *vivo = s->priv_data;
     AVIOContext *pb = s->pb;
     unsigned old_sequence = vivo->sequence, old_type = vivo->type;
-    int stream_index, ret = 0;
+    int stream_index, duration, ret = 0;
 
 restart:
 
-    if (url_feof(pb))
+    if (avio_feof(pb))
         return AVERROR_EOF;
 
     switch (vivo->type) {
@@ -262,10 +270,12 @@ restart:
     case 1:
     case 2: // video
         stream_index = 0;
+        duration = 1;
         break;
     case 3:
     case 4: // audio
         stream_index = 1;
+        duration = vivo->duration;
         break;
     default:
         av_log(s, AV_LOG_ERROR, "unknown packet type %d\n", vivo->type);
@@ -273,32 +283,29 @@ restart:
     }
 
     if ((ret = av_get_packet(pb, pkt, vivo->length)) < 0)
-        goto fail;
+        return ret;
 
     // get next packet header
     if ((ret = vivo_get_packet_header(s)) < 0)
-        goto fail;
+        return ret;
 
     while (vivo->sequence == old_sequence &&
            (((vivo->type - 1) >> 1) == ((old_type - 1) >> 1))) {
-        if (url_feof(pb)) {
-            ret = AVERROR_EOF;
-            break;
+        if (avio_feof(pb)) {
+            return AVERROR_EOF;
         }
 
         if ((ret = av_append_packet(pb, pkt, vivo->length)) < 0)
-            break;
+            return ret;
 
         // get next packet header
         if ((ret = vivo_get_packet_header(s)) < 0)
-            break;
+            return ret;
     }
 
     pkt->stream_index = stream_index;
+    pkt->duration = duration;
 
-fail:
-    if (ret < 0)
-        av_free_packet(pkt);
     return ret;
 }
 

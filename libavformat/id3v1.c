@@ -23,6 +23,7 @@
 #include "libavcodec/avcodec.h"
 #include "libavutil/dict.h"
 
+/* See Genre List at http://id3.org/id3v2.3.0 */
 const char * const ff_id3v1_genre_str[ID3v1_GENRE_MAX + 1] = {
       [0] = "Blues",
       [1] = "Classic Rock",
@@ -91,7 +92,7 @@ const char * const ff_id3v1_genre_str[ID3v1_GENRE_MAX + 1] = {
      [64] = "Native American",
      [65] = "Cabaret",
      [66] = "New Wave",
-     [67] = "Psychadelic",
+     [67] = "Psychedelic",
      [68] = "Rave",
      [69] = "Showtunes",
      [70] = "Trailer",
@@ -109,7 +110,7 @@ const char * const ff_id3v1_genre_str[ID3v1_GENRE_MAX + 1] = {
      [82] = "National Folk",
      [83] = "Swing",
      [84] = "Fast Fusion",
-     [85] = "Bebob",
+     [85] = "Bebop",
      [86] = "Latin",
      [87] = "Revival",
      [88] = "Celtic",
@@ -147,20 +148,20 @@ const char * const ff_id3v1_genre_str[ID3v1_GENRE_MAX + 1] = {
     [120] = "Duet",
     [121] = "Punk Rock",
     [122] = "Drum Solo",
-    [123] = "A capella",
+    [123] = "A Cappella",
     [124] = "Euro-House",
     [125] = "Dance Hall",
     [126] = "Goa",
     [127] = "Drum & Bass",
     [128] = "Club-House",
-    [129] = "Hardcore",
+    [129] = "Hardcore Techno",
     [130] = "Terror",
     [131] = "Indie",
     [132] = "BritPop",
     [133] = "Negerpunk",
     [134] = "Polsk Punk",
     [135] = "Beat",
-    [136] = "Christian Gangsta",
+    [136] = "Christian Gangsta Rap",
     [137] = "Heavy Metal",
     [138] = "Black Metal",
     [139] = "Crossover",
@@ -170,15 +171,59 @@ const char * const ff_id3v1_genre_str[ID3v1_GENRE_MAX + 1] = {
     [143] = "Salsa",
     [144] = "Thrash Metal",
     [145] = "Anime",
-    [146] = "JPop",
-    [147] = "SynthPop",
+    [146] = "Jpop",
+    [147] = "Synthpop",
+    [148] = "Abstract",
+    [149] = "Art Rock",
+    [150] = "Baroque",
+    [151] = "Bhangra",
+    [152] = "Big Beat",
+    [153] = "Breakbeat",
+    [154] = "Chillout",
+    [155] = "Downtempo",
+    [156] = "Dub",
+    [157] = "EBM",
+    [158] = "Eclectic",
+    [159] = "Electro",
+    [160] = "Electroclash",
+    [161] = "Emo",
+    [162] = "Experimental",
+    [163] = "Garage",
+    [164] = "Global",
+    [165] = "IDM",
+    [166] = "Illbient",
+    [167] = "Industro-Goth",
+    [168] = "Jam Band",
+    [169] = "Krautrock",
+    [170] = "Leftfield",
+    [171] = "Lounge",
+    [172] = "Math Rock",
+    [173] = "New Romantic",
+    [174] = "Nu-Breakz",
+    [175] = "Post-Punk",
+    [176] = "Post-Rock",
+    [177] = "Psytrance",
+    [178] = "Shoegaze",
+    [179] = "Space Rock",
+    [180] = "Trop Rock",
+    [181] = "World Music",
+    [182] = "Neoclassical",
+    [183] = "Audiobook",
+    [184] = "Audio Theatre",
+    [185] = "Neue Deutsche Welle",
+    [186] = "Podcast",
+    [187] = "Indie Rock",
+    [188] = "G-Funk",
+    [189] = "Dubstep",
+    [190] = "Garage Rock",
+    [191] = "Psybient"
 };
 
 static void get_string(AVFormatContext *s, const char *key,
                        const uint8_t *buf, int buf_size)
 {
     int i, c;
-    char *q, str[512];
+    char *q, str[512], *first_free_space = NULL;
 
     q = str;
     for(i = 0; i < buf_size; i++) {
@@ -187,9 +232,18 @@ static void get_string(AVFormatContext *s, const char *key,
             break;
         if ((q - str) >= sizeof(str) - 1)
             break;
+        if (c == ' ') {
+            if (!first_free_space)
+                first_free_space = q;
+        } else {
+            first_free_space = NULL;
+        }
         *q++ = c;
     }
     *q = '\0';
+
+    if (first_free_space)
+        *first_free_space = '\0';
 
     if (*str)
         av_dict_set(&s->metadata, key, str, 0);
@@ -202,7 +256,6 @@ static void get_string(AVFormatContext *s, const char *key,
  */
 static int parse_tag(AVFormatContext *s, const uint8_t *buf)
 {
-    char str[5];
     int genre;
 
     if (!(buf[0] == 'T' &&
@@ -215,8 +268,7 @@ static int parse_tag(AVFormatContext *s, const uint8_t *buf)
     get_string(s, "date",    buf + 93,  4);
     get_string(s, "comment", buf + 97, 30);
     if (buf[125] == 0 && buf[126] != 0) {
-        snprintf(str, sizeof(str), "%d", buf[126]);
-        av_dict_set(&s->metadata, "track", str, 0);
+        av_dict_set_int(&s->metadata, "track", buf[126], 0);
     }
     genre = buf[127];
     if (genre <= ID3v1_GENRE_MAX)
@@ -230,7 +282,7 @@ void ff_id3v1_read(AVFormatContext *s)
     uint8_t buf[ID3v1_TAG_SIZE];
     int64_t filesize, position = avio_tell(s->pb);
 
-    if (s->pb->seekable) {
+    if (s->pb->seekable & AVIO_SEEKABLE_NORMAL) {
         /* XXX: change that */
         filesize = avio_size(s->pb);
         if (filesize > 128) {

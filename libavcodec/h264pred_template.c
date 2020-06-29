@@ -21,9 +21,11 @@
 
 /**
  * @file
- * H.264 / AVC / MPEG4 part10 prediction functions.
+ * H.264 / AVC / MPEG-4 part10 prediction functions.
  * @author Michael Niedermayer <michaelni@gmx.at>
  */
+
+#include "libavutil/intreadwrite.h"
 
 #include "mathops.h"
 
@@ -1122,6 +1124,79 @@ static void FUNCC(pred8x8l_horizontal_up)(uint8_t *_src, int has_topleft,
     SRC(5,6)=SRC(5,7)=SRC(6,4)=SRC(6,5)=SRC(6,6)=
     SRC(6,7)=SRC(7,4)=SRC(7,5)=SRC(7,6)=SRC(7,7)= l7;
 }
+
+static void FUNCC(pred8x8l_vertical_filter_add)(uint8_t *_src, int16_t *_block, int has_topleft,
+                                     int has_topright, ptrdiff_t _stride)
+{
+    int i;
+    pixel *src = (pixel*)_src;
+    const dctcoef *block = (const dctcoef*)_block;
+    pixel pix[8];
+    int stride = _stride>>(sizeof(pixel)-1);
+    PREDICT_8x8_LOAD_TOP;
+
+    pix[0] = t0;
+    pix[1] = t1;
+    pix[2] = t2;
+    pix[3] = t3;
+    pix[4] = t4;
+    pix[5] = t5;
+    pix[6] = t6;
+    pix[7] = t7;
+
+    for(i=0; i<8; i++){
+        pixel v = pix[i];
+        src[0*stride]= v += block[0];
+        src[1*stride]= v += block[8];
+        src[2*stride]= v += block[16];
+        src[3*stride]= v += block[24];
+        src[4*stride]= v += block[32];
+        src[5*stride]= v += block[40];
+        src[6*stride]= v += block[48];
+        src[7*stride]= v +  block[56];
+        src++;
+        block++;
+    }
+
+    memset(_block, 0, sizeof(dctcoef) * 64);
+}
+
+static void FUNCC(pred8x8l_horizontal_filter_add)(uint8_t *_src, int16_t *_block, int has_topleft,
+                               int has_topright, ptrdiff_t _stride)
+{
+    int i;
+    pixel *src = (pixel*)_src;
+    const dctcoef *block = (const dctcoef*)_block;
+    pixel pix[8];
+    int stride = _stride>>(sizeof(pixel)-1);
+    PREDICT_8x8_LOAD_LEFT;
+
+    pix[0] = l0;
+    pix[1] = l1;
+    pix[2] = l2;
+    pix[3] = l3;
+    pix[4] = l4;
+    pix[5] = l5;
+    pix[6] = l6;
+    pix[7] = l7;
+
+    for(i=0; i<8; i++){
+        pixel v = pix[i];
+        src[0]= v += block[0];
+        src[1]= v += block[1];
+        src[2]= v += block[2];
+        src[3]= v += block[3];
+        src[4]= v += block[4];
+        src[5]= v += block[5];
+        src[6]= v += block[6];
+        src[7]= v +  block[7];
+        src+= stride;
+        block+= 8;
+    }
+
+    memset(_block, 0, sizeof(dctcoef) * 64);
+}
+
 #undef PREDICT_8x8_LOAD_LEFT
 #undef PREDICT_8x8_LOAD_TOP
 #undef PREDICT_8x8_LOAD_TOPLEFT
@@ -1132,7 +1207,7 @@ static void FUNCC(pred8x8l_horizontal_up)(uint8_t *_src, int has_topleft,
 #undef PL
 #undef SRC
 
-static void FUNCC(pred4x4_vertical_add)(uint8_t *_pix, const DCTELEM *_block,
+static void FUNCC(pred4x4_vertical_add)(uint8_t *_pix, int16_t *_block,
                                         ptrdiff_t stride)
 {
     int i;
@@ -1149,9 +1224,11 @@ static void FUNCC(pred4x4_vertical_add)(uint8_t *_pix, const DCTELEM *_block,
         pix++;
         block++;
     }
+
+    memset(_block, 0, sizeof(dctcoef) * 16);
 }
 
-static void FUNCC(pred4x4_horizontal_add)(uint8_t *_pix, const DCTELEM *_block,
+static void FUNCC(pred4x4_horizontal_add)(uint8_t *_pix, int16_t *_block,
                                           ptrdiff_t stride)
 {
     int i;
@@ -1167,9 +1244,11 @@ static void FUNCC(pred4x4_horizontal_add)(uint8_t *_pix, const DCTELEM *_block,
         pix+= stride;
         block+= 4;
     }
+
+    memset(_block, 0, sizeof(dctcoef) * 16);
 }
 
-static void FUNCC(pred8x8l_vertical_add)(uint8_t *_pix, const DCTELEM *_block,
+static void FUNCC(pred8x8l_vertical_add)(uint8_t *_pix, int16_t *_block,
                                          ptrdiff_t stride)
 {
     int i;
@@ -1190,9 +1269,11 @@ static void FUNCC(pred8x8l_vertical_add)(uint8_t *_pix, const DCTELEM *_block,
         pix++;
         block++;
     }
+
+    memset(_block, 0, sizeof(dctcoef) * 64);
 }
 
-static void FUNCC(pred8x8l_horizontal_add)(uint8_t *_pix, const DCTELEM *_block,
+static void FUNCC(pred8x8l_horizontal_add)(uint8_t *_pix, int16_t *_block,
                                            ptrdiff_t stride)
 {
     int i;
@@ -1212,10 +1293,12 @@ static void FUNCC(pred8x8l_horizontal_add)(uint8_t *_pix, const DCTELEM *_block,
         pix+= stride;
         block+= 8;
     }
+
+    memset(_block, 0, sizeof(dctcoef) * 64);
 }
 
 static void FUNCC(pred16x16_vertical_add)(uint8_t *pix, const int *block_offset,
-                                          const DCTELEM *block,
+                                          int16_t *block,
                                           ptrdiff_t stride)
 {
     int i;
@@ -1225,7 +1308,7 @@ static void FUNCC(pred16x16_vertical_add)(uint8_t *pix, const int *block_offset,
 
 static void FUNCC(pred16x16_horizontal_add)(uint8_t *pix,
                                             const int *block_offset,
-                                            const DCTELEM *block,
+                                            int16_t *block,
                                             ptrdiff_t stride)
 {
     int i;
@@ -1234,7 +1317,7 @@ static void FUNCC(pred16x16_horizontal_add)(uint8_t *pix,
 }
 
 static void FUNCC(pred8x8_vertical_add)(uint8_t *pix, const int *block_offset,
-                                        const DCTELEM *block, ptrdiff_t stride)
+                                        int16_t *block, ptrdiff_t stride)
 {
     int i;
     for(i=0; i<4; i++)
@@ -1242,7 +1325,7 @@ static void FUNCC(pred8x8_vertical_add)(uint8_t *pix, const int *block_offset,
 }
 
 static void FUNCC(pred8x16_vertical_add)(uint8_t *pix, const int *block_offset,
-                                         const DCTELEM *block, ptrdiff_t stride)
+                                         int16_t *block, ptrdiff_t stride)
 {
     int i;
     for(i=0; i<4; i++)
@@ -1252,7 +1335,7 @@ static void FUNCC(pred8x16_vertical_add)(uint8_t *pix, const int *block_offset,
 }
 
 static void FUNCC(pred8x8_horizontal_add)(uint8_t *pix, const int *block_offset,
-                                          const DCTELEM *block,
+                                          int16_t *block,
                                           ptrdiff_t stride)
 {
     int i;
@@ -1262,7 +1345,7 @@ static void FUNCC(pred8x8_horizontal_add)(uint8_t *pix, const int *block_offset,
 
 static void FUNCC(pred8x16_horizontal_add)(uint8_t *pix,
                                            const int *block_offset,
-                                           const DCTELEM *block, ptrdiff_t stride)
+                                           int16_t *block, ptrdiff_t stride)
 {
     int i;
     for(i=0; i<4; i++)

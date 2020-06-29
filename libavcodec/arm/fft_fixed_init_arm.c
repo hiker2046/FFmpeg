@@ -18,9 +18,11 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/attributes.h"
+#include "libavutil/cpu.h"
 #include "libavutil/arm/cpu.h"
 
-#define CONFIG_FFT_FLOAT 0
+#define FFT_FLOAT 0
 #include "libavcodec/fft.h"
 
 void ff_fft_fixed_calc_neon(FFTContext *s, FFTComplex *z);
@@ -33,7 +35,9 @@ av_cold void ff_fft_fixed_init_arm(FFTContext *s)
 
     if (have_neon(cpu_flags)) {
         s->fft_permutation = FF_FFT_PERM_SWAP_LSBS;
+#if CONFIG_FFT
         s->fft_calc        = ff_fft_fixed_calc_neon;
+#endif
 
 #if CONFIG_MDCT
         if (!s->inverse && s->nbits >= 3) {

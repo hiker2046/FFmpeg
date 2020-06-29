@@ -28,6 +28,7 @@
 #ifndef AVCODEC_DIRAC_ARITH_H
 #define AVCODEC_DIRAC_ARITH_H
 
+#include "libavutil/x86/asm.h"
 #include "bytestream.h"
 #include "get_bits.h"
 
@@ -80,6 +81,8 @@ typedef struct {
     const uint8_t *bytestream_end;
 
     uint16_t contexts[DIRAC_CTX_COUNT];
+    int error;
+    int overread;
 } DiracArith;
 
 extern const uint8_t ff_dirac_next_ctx[DIRAC_CTX_COUNT];
@@ -117,6 +120,9 @@ static inline void refill(DiracArith *c)
                 new |= 0xff00;
 
             c->bytestream = c->bytestream_end;
+            c->overread ++;
+            if (c->overread > 4)
+                c->error = AVERROR_INVALIDDATA;
         }
 
         c->low += new << counter;
@@ -134,7 +140,7 @@ static inline int dirac_get_arith_bit(DiracArith *c, int ctx)
 
     range_times_prob = (c->range * prob_zero) >> 16;
 
-#if HAVE_FAST_CMOV && HAVE_INLINE_ASM
+#if ARCH_X86 && HAVE_FAST_CMOV && HAVE_INLINE_ASM && HAVE_6REGS
     low   -= range_times_prob << 16;
     range -= range_times_prob;
     bit = 0;
@@ -170,6 +176,11 @@ static inline int dirac_get_arith_uint(DiracArith *c, int follow_ctx, int data_c
 {
     int ret = 1;
     while (!dirac_get_arith_bit(c, follow_ctx)) {
+        if (ret >= 0x40000000) {
+            av_log(NULL, AV_LOG_ERROR, "dirac_get_arith_uint overflow\n");
+            c->error = AVERROR_INVALIDDATA;
+            return -1;
+        }
         ret <<= 1;
         ret += dirac_get_arith_bit(c, data_ctx);
         follow_ctx = ff_dirac_next_ctx[follow_ctx];
@@ -185,6 +196,7 @@ static inline int dirac_get_arith_int(DiracArith *c, int follow_ctx, int data_ct
     return ret;
 }
 
+void ff_dirac_init_arith_tables(void);
 void ff_dirac_init_arith_decoder(DiracArith *c, GetBitContext *gb, int length);
 
 #endif /* AVCODEC_DIRAC_ARITH_H */

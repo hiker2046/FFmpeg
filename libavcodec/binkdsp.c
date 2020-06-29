@@ -1,6 +1,6 @@
 /*
  * Bink DSP routines
- * Copyright (c) 2009 Kostya Shishkov
+ * Copyright (c) 2009 Konstantin Shishkov
  *
  * This file is part of FFmpeg.
  *
@@ -24,7 +24,8 @@
  * Bink DSP routines
  */
 
-#include "dsputil.h"
+#include "config.h"
+#include "libavutil/attributes.h"
 #include "binkdsp.h"
 
 #define A1  2896 /* (1/sqrt(2))<<12 */
@@ -32,20 +33,22 @@
 #define A3  3784
 #define A4 -5352
 
+#define MUL(X,Y) ((int)((unsigned)(X) * (Y)) >> 11)
+
 #define IDCT_TRANSFORM(dest,s0,s1,s2,s3,s4,s5,s6,s7,d0,d1,d2,d3,d4,d5,d6,d7,munge,src) {\
     const int a0 = (src)[s0] + (src)[s4]; \
     const int a1 = (src)[s0] - (src)[s4]; \
     const int a2 = (src)[s2] + (src)[s6]; \
-    const int a3 = (A1*((src)[s2] - (src)[s6])) >> 11; \
+    const int a3 = MUL(A1, (src)[s2] - (src)[s6]); \
     const int a4 = (src)[s5] + (src)[s3]; \
     const int a5 = (src)[s5] - (src)[s3]; \
     const int a6 = (src)[s1] + (src)[s7]; \
     const int a7 = (src)[s1] - (src)[s7]; \
     const int b0 = a4 + a6; \
-    const int b1 = (A3*(a5 + a7)) >> 11; \
-    const int b2 = ((A4*a5) >> 11) - b0 + b1; \
-    const int b3 = (A1*(a6 - a4) >> 11) - b2; \
-    const int b4 = ((A2*a7) >> 11) + b3 - b1; \
+    const int b1 = MUL(A3, a5 + a7); \
+    const int b2 = MUL(A4, a5) - b0 + b1; \
+    const int b3 = MUL(A1, a6 - a4) - b2; \
+    const int b4 = MUL(A2, a7) + b3 - b1; \
     (dest)[d0] = munge(a0+a2   +b0); \
     (dest)[d1] = munge(a1+a3-a2+b2); \
     (dest)[d2] = munge(a1-a3+a2+b3); \
@@ -128,9 +131,29 @@ static void scale_block_c(const uint8_t src[64]/*align 8*/, uint8_t *dst/*align 
     }
 }
 
-void ff_binkdsp_init(BinkDSPContext *c)
+static void add_pixels8_c(uint8_t *av_restrict pixels, int16_t *block,
+                          int line_size)
+{
+    int i;
+
+    for (i = 0; i < 8; i++) {
+        pixels[0] += block[0];
+        pixels[1] += block[1];
+        pixels[2] += block[2];
+        pixels[3] += block[3];
+        pixels[4] += block[4];
+        pixels[5] += block[5];
+        pixels[6] += block[6];
+        pixels[7] += block[7];
+        pixels    += line_size;
+        block     += 8;
+    }
+}
+
+av_cold void ff_binkdsp_init(BinkDSPContext *c)
 {
     c->idct_add    = bink_idct_add_c;
     c->idct_put    = bink_idct_put_c;
     c->scale_block = scale_block_c;
+    c->add_pixels8 = add_pixels8_c;
 }

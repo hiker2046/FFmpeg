@@ -24,17 +24,19 @@
  * VBLE Decoder
  */
 
-#define BITSTREAM_READER_LE
+#include "libavutil/imgutils.h"
 
+#define BITSTREAM_READER_LE
 #include "avcodec.h"
-#include "dsputil.h"
 #include "get_bits.h"
 #include "internal.h"
+#include "lossless_videodsp.h"
 #include "mathops.h"
+#include "thread.h"
 
-typedef struct {
+typedef struct VBLEContext {
     AVCodecContext *avctx;
-    DSPContext dsp;
+    LLVidDSPContext llviddsp;
 
     int            size;
     uint8_t        *val; ///< This array first holds the lengths of vlc symbols and then their value.
@@ -80,10 +82,10 @@ static int vble_unpack(VBLEContext *ctx, GetBitContext *gb)
     return 0;
 }
 
-static void vble_restore_plane(VBLEContext *ctx, GetBitContext *gb, int plane,
+static void vble_restore_plane(VBLEContext *ctx, AVFrame *pic,
+                               GetBitContext *gb, int plane,
                                int offset, int width, int height)
 {
-    AVFrame *pic = ctx->avctx->coded_frame;
     uint8_t *dst = pic->data[plane];
     uint8_t *val = ctx->val + offset;
     int stride = pic->linesize[plane];
@@ -100,7 +102,8 @@ static void vble_restore_plane(VBLEContext *ctx, GetBitContext *gb, int plane,
         if (i) {
             left = 0;
             left_top = dst[-stride];
-            ctx->dsp.add_hfyu_median_prediction(dst, dst-stride, val, width, &left, &left_top);
+            ctx->llviddsp.add_median_pred(dst, dst - stride, val,
+                                          width, &left, &left_top);
         } else {
             dst[0] = val[0];
             for (j = 1; j < width; j++)
@@ -115,18 +118,14 @@ static int vble_decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
                              AVPacket *avpkt)
 {
     VBLEContext *ctx = avctx->priv_data;
-    AVFrame *pic = avctx->coded_frame;
+    AVFrame *pic     = data;
     GetBitContext gb;
     const uint8_t *src = avpkt->data;
     int version;
     int offset = 0;
     int width_uv = avctx->width / 2, height_uv = avctx->height / 2;
-
-    pic->reference = 0;
-
-    /* Clear buffer if need be */
-    if (pic->data[0])
-        avctx->release_buffer(avctx, pic);
+    int ret;
+    ThreadFrame frame = { .f = data };
 
     if (avpkt->size < 4 || avpkt->size - 4 > INT_MAX/8) {
         av_log(avctx, AV_LOG_ERROR, "Invalid packet size\n");
@@ -134,10 +133,8 @@ static int vble_decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
     }
 
     /* Allocate buffer */
-    if (ff_get_buffer(avctx, pic) < 0) {
-        av_log(avctx, AV_LOG_ERROR, "Could not allocate buffer.\n");
-        return AVERROR(ENOMEM);
-    }
+    if ((ret = ff_thread_get_buffer(avctx, &frame, 0)) < 0)
+        return ret;
 
     /* Set flags */
     pic->key_frame = 1;
@@ -158,19 +155,18 @@ static int vble_decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
     }
 
     /* Restore planes. Should be almost identical to Huffyuv's. */
-    vble_restore_plane(ctx, &gb, 0, offset, avctx->width, avctx->height);
+    vble_restore_plane(ctx, pic, &gb, 0, offset, avctx->width, avctx->height);
 
     /* Chroma */
-    if (!(ctx->avctx->flags & CODEC_FLAG_GRAY)) {
+    if (!(ctx->avctx->flags & AV_CODEC_FLAG_GRAY)) {
         offset += avctx->width * avctx->height;
-        vble_restore_plane(ctx, &gb, 1, offset, width_uv, height_uv);
+        vble_restore_plane(ctx, pic, &gb, 1, offset, width_uv, height_uv);
 
         offset += width_uv * height_uv;
-        vble_restore_plane(ctx, &gb, 2, offset, width_uv, height_uv);
+        vble_restore_plane(ctx, pic, &gb, 2, offset, width_uv, height_uv);
     }
 
     *got_frame       = 1;
-    *(AVFrame *)data = *pic;
 
     return avpkt->size;
 }
@@ -178,12 +174,6 @@ static int vble_decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
 static av_cold int vble_decode_close(AVCodecContext *avctx)
 {
     VBLEContext *ctx = avctx->priv_data;
-    AVFrame *pic = avctx->coded_frame;
-
-    if (pic->data[0])
-        avctx->release_buffer(avctx, pic);
-
-    av_freep(&avctx->coded_frame);
     av_freep(&ctx->val);
 
     return 0;
@@ -195,21 +185,15 @@ static av_cold int vble_decode_init(AVCodecContext *avctx)
 
     /* Stash for later use */
     ctx->avctx = avctx;
-    ff_dsputil_init(&ctx->dsp, avctx);
+    ff_llviddsp_init(&ctx->llviddsp);
 
     avctx->pix_fmt = AV_PIX_FMT_YUV420P;
     avctx->bits_per_raw_sample = 8;
-    avctx->coded_frame = avcodec_alloc_frame();
 
-    if (!avctx->coded_frame) {
-        av_log(avctx, AV_LOG_ERROR, "Could not allocate frame.\n");
-        return AVERROR(ENOMEM);
-    }
+    ctx->size = av_image_get_buffer_size(avctx->pix_fmt,
+                                         avctx->width, avctx->height, 1);
 
-    ctx->size = avpicture_get_size(avctx->pix_fmt,
-                                   avctx->width, avctx->height);
-
-    ctx->val = av_malloc(ctx->size * sizeof(*ctx->val));
+    ctx->val = av_malloc_array(ctx->size, sizeof(*ctx->val));
 
     if (!ctx->val) {
         av_log(avctx, AV_LOG_ERROR, "Could not allocate values buffer.\n");
@@ -222,12 +206,13 @@ static av_cold int vble_decode_init(AVCodecContext *avctx)
 
 AVCodec ff_vble_decoder = {
     .name           = "vble",
+    .long_name      = NULL_IF_CONFIG_SMALL("VBLE Lossless Codec"),
     .type           = AVMEDIA_TYPE_VIDEO,
     .id             = AV_CODEC_ID_VBLE,
     .priv_data_size = sizeof(VBLEContext),
     .init           = vble_decode_init,
     .close          = vble_decode_close,
     .decode         = vble_decode_frame,
-    .capabilities   = CODEC_CAP_DR1,
-    .long_name      = NULL_IF_CONFIG_SMALL("VBLE Lossless Codec"),
+    .capabilities   = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_FRAME_THREADS,
+    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE,
 };

@@ -19,6 +19,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/imgutils.h"
 #include "libavutil/parseutils.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/opt.h"
@@ -27,33 +28,26 @@
 
 typedef struct RawVideoDemuxerContext {
     const AVClass *class;     /**< Class for private options. */
-    char *video_size;         /**< String describing video size, set by a private option. */
+    int width, height;        /**< Integers describing video size, set by a private option. */
     char *pixel_format;       /**< Set by a private option. */
-    char *framerate;          /**< String describing framerate, set by a private option. */
+    AVRational framerate;     /**< AVRational describing framerate, set by a private option. */
 } RawVideoDemuxerContext;
 
 
 static int rawvideo_read_header(AVFormatContext *ctx)
 {
     RawVideoDemuxerContext *s = ctx->priv_data;
-    int width = 0, height = 0, ret = 0;
     enum AVPixelFormat pix_fmt;
-    AVRational framerate;
     AVStream *st;
+    int packet_size;
 
     st = avformat_new_stream(ctx, NULL);
     if (!st)
         return AVERROR(ENOMEM);
 
-    st->codec->codec_type = AVMEDIA_TYPE_VIDEO;
+    st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
 
-    st->codec->codec_id = ctx->iformat->raw_codec_id;
-
-    if (s->video_size &&
-        (ret = av_parse_video_size(&width, &height, s->video_size)) < 0) {
-        av_log(ctx, AV_LOG_ERROR, "Couldn't parse video size.\n");
-        return ret;
-    }
+    st->codecpar->codec_id = ctx->iformat->raw_codec_id;
 
     if ((pix_fmt = av_get_pix_fmt(s->pixel_format)) == AV_PIX_FMT_NONE) {
         av_log(ctx, AV_LOG_ERROR, "No such pixel format: %s.\n",
@@ -61,18 +55,16 @@ static int rawvideo_read_header(AVFormatContext *ctx)
         return AVERROR(EINVAL);
     }
 
-    if ((ret = av_parse_video_rate(&framerate, s->framerate)) < 0) {
-        av_log(ctx, AV_LOG_ERROR, "Could not parse framerate: %s.\n",
-               s->framerate);
-        return ret;
-    }
+    avpriv_set_pts_info(st, 64, s->framerate.den, s->framerate.num);
 
-    avpriv_set_pts_info(st, 64, framerate.den, framerate.num);
-
-    st->codec->width  = width;
-    st->codec->height = height;
-    st->codec->pix_fmt = pix_fmt;
-    st->codec->bit_rate = av_rescale_q(avpicture_get_size(st->codec->pix_fmt, width, height),
+    st->codecpar->width  = s->width;
+    st->codecpar->height = s->height;
+    st->codecpar->format = pix_fmt;
+    packet_size = av_image_get_buffer_size(st->codecpar->format, s->width, s->height, 1);
+    if (packet_size < 0)
+        return packet_size;
+    ctx->packet_size = packet_size;
+    st->codecpar->bit_rate = av_rescale_q(ctx->packet_size,
                                        (AVRational){8,1}, st->time_base);
 
     return 0;
@@ -81,18 +73,10 @@ static int rawvideo_read_header(AVFormatContext *ctx)
 
 static int rawvideo_read_packet(AVFormatContext *s, AVPacket *pkt)
 {
-    int packet_size, ret, width, height;
-    AVStream *st = s->streams[0];
+    int ret;
 
-    width = st->codec->width;
-    height = st->codec->height;
-
-    packet_size = avpicture_get_size(st->codec->pix_fmt, width, height);
-    if (packet_size < 0)
-        return -1;
-
-    ret = av_get_packet(s->pb, pkt, packet_size);
-    pkt->pts = pkt->dts = pkt->pos / packet_size;
+    ret = av_get_packet(s->pb, pkt, s->packet_size);
+    pkt->pts = pkt->dts = pkt->pos / s->packet_size;
 
     pkt->stream_index = 0;
     if (ret < 0)
@@ -103,9 +87,9 @@ static int rawvideo_read_packet(AVFormatContext *s, AVPacket *pkt)
 #define OFFSET(x) offsetof(RawVideoDemuxerContext, x)
 #define DEC AV_OPT_FLAG_DECODING_PARAM
 static const AVOption rawvideo_options[] = {
-    { "video_size", "A string describing frame size, such as 640x480 or hd720.", OFFSET(video_size), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, DEC },
-    { "pixel_format", "", OFFSET(pixel_format), AV_OPT_TYPE_STRING, {.str = "yuv420p"}, 0, 0, DEC },
-    { "framerate", "", OFFSET(framerate), AV_OPT_TYPE_STRING, {.str = "25"}, 0, 0, DEC },
+    { "video_size", "set frame size", OFFSET(width), AV_OPT_TYPE_IMAGE_SIZE, {.str = NULL}, 0, 0, DEC },
+    { "pixel_format", "set pixel format", OFFSET(pixel_format), AV_OPT_TYPE_STRING, {.str = "yuv420p"}, 0, 0, DEC },
+    { "framerate", "set frame rate", OFFSET(framerate), AV_OPT_TYPE_VIDEO_RATE, {.str = "25"}, 0, INT_MAX, DEC },
     { NULL },
 };
 

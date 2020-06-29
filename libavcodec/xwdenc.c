@@ -30,17 +30,8 @@
 #define WINDOW_NAME         "lavcxwdenc"
 #define WINDOW_NAME_SIZE    11
 
-static av_cold int xwd_encode_init(AVCodecContext *avctx)
-{
-    avctx->coded_frame = avcodec_alloc_frame();
-    if (!avctx->coded_frame)
-        return AVERROR(ENOMEM);
-
-    return 0;
-}
-
 static int xwd_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
-                            const AVFrame *p, int *got_packet)
+                            const AVFrame *pict, int *got_packet)
 {
     enum AVPixelFormat pix_fmt = avctx->pix_fmt;
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(pix_fmt);
@@ -49,9 +40,11 @@ static int xwd_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     uint32_t header_size;
     int i, out_size, ret;
     uint8_t *ptr, *buf;
+    AVFrame * const p = (AVFrame *)pict;
+    uint32_t pal[256];
 
     pixdepth = av_get_bits_per_pixel(desc);
-    if (desc->flags & PIX_FMT_BE)
+    if (desc->flags & AV_PIX_FMT_FLAG_BE)
         be = 1;
     switch (pix_fmt) {
     case AV_PIX_FMT_ARGB:
@@ -146,7 +139,7 @@ static int xwd_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
         vclass   = XWD_STATIC_GRAY;
         break;
     default:
-        av_log(avctx, AV_LOG_INFO, "unsupported pixel format\n");
+        av_log(avctx, AV_LOG_ERROR, "unsupported pixel format\n");
         return AVERROR(EINVAL);
     }
 
@@ -154,12 +147,12 @@ static int xwd_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     header_size = XWD_HEADER_SIZE + WINDOW_NAME_SIZE;
     out_size    = header_size + ncolors * XWD_CMAP_SIZE + avctx->height * lsize;
 
-    if ((ret = ff_alloc_packet2(avctx, pkt, out_size)) < 0)
+    if ((ret = ff_alloc_packet2(avctx, pkt, out_size, 0)) < 0)
         return ret;
     buf = pkt->data;
 
-    avctx->coded_frame->key_frame = 1;
-    avctx->coded_frame->pict_type = AV_PICTURE_TYPE_I;
+    p->key_frame = 1;
+    p->pict_type = AV_PICTURE_TYPE_I;
 
     bytestream_put_be32(&buf, header_size);
     bytestream_put_be32(&buf, XWD_VERSION);   // file version
@@ -188,11 +181,17 @@ static int xwd_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     bytestream_put_be32(&buf, 0);             // window border width
     bytestream_put_buffer(&buf, WINDOW_NAME, WINDOW_NAME_SIZE);
 
+    if (pix_fmt == AV_PIX_FMT_PAL8) {
+        memcpy(pal, p->data[1], sizeof(pal));
+    } else {
+        avpriv_set_systematic_pal2(pal, pix_fmt);
+    }
+
     for (i = 0; i < ncolors; i++) {
         uint32_t val;
         uint8_t red, green, blue;
 
-        val   = AV_RN32A(p->data[1] + i * 4);
+        val   = pal[i];
         red   = (val >> 16) & 0xFF;
         green = (val >>  8) & 0xFF;
         blue  =  val        & 0xFF;
@@ -216,20 +215,12 @@ static int xwd_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     return 0;
 }
 
-static av_cold int xwd_encode_close(AVCodecContext *avctx)
-{
-    av_freep(&avctx->coded_frame);
-
-    return 0;
-}
-
 AVCodec ff_xwd_encoder = {
     .name         = "xwd",
+    .long_name    = NULL_IF_CONFIG_SMALL("XWD (X Window Dump) image"),
     .type         = AVMEDIA_TYPE_VIDEO,
     .id           = AV_CODEC_ID_XWD,
-    .init         = xwd_encode_init,
     .encode2      = xwd_encode_frame,
-    .close        = xwd_encode_close,
     .pix_fmts     = (const enum AVPixelFormat[]) { AV_PIX_FMT_BGRA,
                                                  AV_PIX_FMT_RGBA,
                                                  AV_PIX_FMT_ARGB,
@@ -252,5 +243,4 @@ AVCodec ff_xwd_encoder = {
                                                  AV_PIX_FMT_GRAY8,
                                                  AV_PIX_FMT_MONOWHITE,
                                                  AV_PIX_FMT_NONE },
-    .long_name    = NULL_IF_CONFIG_SMALL("XWD (X Window Dump) image"),
 };

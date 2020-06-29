@@ -22,16 +22,13 @@
 
 #include "libavutil/avstring.h"
 #include "internal.h"
+#include "img2.h"
 
-typedef struct {
-    enum AVCodecID id;
-    const char *str;
-} IdStrMap;
-
-static const IdStrMap img_tags[] = {
+const IdStrMap ff_img_tags[] = {
     { AV_CODEC_ID_MJPEG,      "jpeg"     },
     { AV_CODEC_ID_MJPEG,      "jpg"      },
     { AV_CODEC_ID_MJPEG,      "jps"      },
+    { AV_CODEC_ID_MJPEG,      "mpo"      },
     { AV_CODEC_ID_LJPEG,      "ljpg"     },
     { AV_CODEC_ID_JPEGLS,     "jls"      },
     { AV_CODEC_ID_PNG,        "png"      },
@@ -43,21 +40,25 @@ static const IdStrMap img_tags[] = {
     { AV_CODEC_ID_PGMYUV,     "pgmyuv"   },
     { AV_CODEC_ID_PBM,        "pbm"      },
     { AV_CODEC_ID_PAM,        "pam"      },
+    { AV_CODEC_ID_PFM,        "pfm"      },
+    { AV_CODEC_ID_ALIAS_PIX,  "pix"      },
+    { AV_CODEC_ID_DDS,        "dds"      },
     { AV_CODEC_ID_MPEG1VIDEO, "mpg1-img" },
     { AV_CODEC_ID_MPEG2VIDEO, "mpg2-img" },
     { AV_CODEC_ID_MPEG4,      "mpg4-img" },
-    { AV_CODEC_ID_FFV1,       "ffv1-img" },
     { AV_CODEC_ID_RAWVIDEO,   "y"        },
     { AV_CODEC_ID_RAWVIDEO,   "raw"      },
     { AV_CODEC_ID_BMP,        "bmp"      },
-    { AV_CODEC_ID_GIF,        "gif"      },
     { AV_CODEC_ID_TARGA,      "tga"      },
     { AV_CODEC_ID_TIFF,       "tiff"     },
     { AV_CODEC_ID_TIFF,       "tif"      },
+    { AV_CODEC_ID_TIFF,       "dng"      },
     { AV_CODEC_ID_SGI,        "sgi"      },
     { AV_CODEC_ID_PTX,        "ptx"      },
     { AV_CODEC_ID_PCX,        "pcx"      },
-    { AV_CODEC_ID_BRENDER_PIX, "pix"     },
+    { AV_CODEC_ID_QDRAW,      "pic"      },
+    { AV_CODEC_ID_QDRAW,      "pct"      },
+    { AV_CODEC_ID_QDRAW,      "pict"     },
     { AV_CODEC_ID_SUNRAST,    "sun"      },
     { AV_CODEC_ID_SUNRAST,    "ras"      },
     { AV_CODEC_ID_SUNRAST,    "rs"       },
@@ -66,21 +67,25 @@ static const IdStrMap img_tags[] = {
     { AV_CODEC_ID_SUNRAST,    "im24"     },
     { AV_CODEC_ID_SUNRAST,    "im32"     },
     { AV_CODEC_ID_SUNRAST,    "sunras"   },
+    { AV_CODEC_ID_SVG,        "svg"      },
+    { AV_CODEC_ID_SVG,        "svgz"     },
     { AV_CODEC_ID_JPEG2000,   "j2c"      },
-    { AV_CODEC_ID_JPEG2000,   "j2k"      },
     { AV_CODEC_ID_JPEG2000,   "jp2"      },
     { AV_CODEC_ID_JPEG2000,   "jpc"      },
+    { AV_CODEC_ID_JPEG2000,   "j2k"      },
     { AV_CODEC_ID_DPX,        "dpx"      },
     { AV_CODEC_ID_EXR,        "exr"      },
     { AV_CODEC_ID_PICTOR,     "pic"      },
     { AV_CODEC_ID_V210X,      "yuv10"    },
+    { AV_CODEC_ID_WEBP,       "webp"     },
     { AV_CODEC_ID_XBM,        "xbm"      },
+    { AV_CODEC_ID_XPM,        "xpm"      },
     { AV_CODEC_ID_XFACE,      "xface"    },
     { AV_CODEC_ID_XWD,        "xwd"      },
     { AV_CODEC_ID_NONE,       NULL       }
 };
 
-static enum AVCodecID av_str2id(const IdStrMap *tags, const char *str)
+static enum AVCodecID str2id(const IdStrMap *tags, const char *str)
 {
     str = strrchr(str, '.');
     if (!str)
@@ -98,5 +103,5 @@ static enum AVCodecID av_str2id(const IdStrMap *tags, const char *str)
 
 enum AVCodecID ff_guess_image2_codec(const char *filename)
 {
-    return av_str2id(img_tags, filename);
+    return str2id(ff_img_tags, filename);
 }

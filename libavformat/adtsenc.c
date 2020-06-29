@@ -24,22 +24,28 @@
 #include "libavcodec/put_bits.h"
 #include "libavcodec/avcodec.h"
 #include "libavcodec/mpeg4audio.h"
+#include "libavutil/opt.h"
 #include "avformat.h"
+#include "apetag.h"
+#include "id3v2.h"
 
 #define ADTS_HEADER_SIZE 7
 
-typedef struct {
+typedef struct ADTSContext {
+    AVClass *class;
     int write_adts;
     int objecttype;
     int sample_rate_index;
     int channel_conf;
     int pce_size;
+    int apetag;
+    int id3v2tag;
     uint8_t pce_data[MAX_PCE_SIZE];
 } ADTSContext;
 
 #define ADTS_MAX_FRAME_BYTES ((1 << 13) - 1)
 
-static int adts_decode_extradata(AVFormatContext *s, ADTSContext *adts, uint8_t *buf, int size)
+static int adts_decode_extradata(AVFormatContext *s, ADTSContext *adts, const uint8_t *buf, int size)
 {
     GetBitContext gb;
     PutBitContext pb;
@@ -47,7 +53,7 @@ static int adts_decode_extradata(AVFormatContext *s, ADTSContext *adts, uint8_t 
     int off;
 
     init_get_bits(&gb, buf, size * 8);
-    off = avpriv_mpeg4audio_get_config(&m4ac, buf, size * 8, 1);
+    off = avpriv_mpeg4audio_get_config2(&m4ac, buf, size, 1, s);
     if (off < 0)
         return off;
     skip_bits_long(&gb, off);
@@ -57,29 +63,29 @@ static int adts_decode_extradata(AVFormatContext *s, ADTSContext *adts, uint8_t 
 
     if (adts->objecttype > 3U) {
         av_log(s, AV_LOG_ERROR, "MPEG-4 AOT %d is not allowed in ADTS\n", adts->objecttype+1);
-        return -1;
+        return AVERROR_INVALIDDATA;
     }
     if (adts->sample_rate_index == 15) {
         av_log(s, AV_LOG_ERROR, "Escape sample rate index illegal in ADTS\n");
-        return -1;
+        return AVERROR_INVALIDDATA;
     }
     if (get_bits(&gb, 1)) {
         av_log(s, AV_LOG_ERROR, "960/120 MDCT window is not allowed in ADTS\n");
-        return -1;
+        return AVERROR_INVALIDDATA;
     }
     if (get_bits(&gb, 1)) {
         av_log(s, AV_LOG_ERROR, "Scalable configurations are not allowed in ADTS\n");
-        return -1;
+        return AVERROR_INVALIDDATA;
     }
     if (get_bits(&gb, 1)) {
         av_log(s, AV_LOG_ERROR, "Extension flag is not allowed in ADTS\n");
-        return -1;
+        return AVERROR_INVALIDDATA;
     }
     if (!adts->channel_conf) {
         init_put_bits(&pb, adts->pce_data, MAX_PCE_SIZE);
 
         put_bits(&pb, 3, 5); //ID_PCE
-        adts->pce_size = (avpriv_copy_pce_data(&pb, &gb) + 3) / 8;
+        adts->pce_size = (ff_copy_pce_data(&pb, &gb) + 3) / 8;
         flush_put_bits(&pb);
     }
 
@@ -88,14 +94,28 @@ static int adts_decode_extradata(AVFormatContext *s, ADTSContext *adts, uint8_t 
     return 0;
 }
 
+static int adts_init(AVFormatContext *s)
+{
+    ADTSContext *adts = s->priv_data;
+    AVCodecParameters *par = s->streams[0]->codecpar;
+
+    if (par->codec_id != AV_CODEC_ID_AAC) {
+        av_log(s, AV_LOG_ERROR, "Only AAC streams can be muxed by the ADTS muxer\n");
+        return AVERROR(EINVAL);
+    }
+    if (par->extradata_size > 0)
+        return adts_decode_extradata(s, adts, par->extradata,
+                                     par->extradata_size);
+
+    return 0;
+}
+
 static int adts_write_header(AVFormatContext *s)
 {
     ADTSContext *adts = s->priv_data;
-    AVCodecContext *avc = s->streams[0]->codec;
 
-    if (avc->extradata_size > 0 &&
-            adts_decode_extradata(s, adts, avc->extradata, avc->extradata_size) < 0)
-        return -1;
+    if (adts->id3v2tag)
+        ff_id3v2_write_simple(s, 4, ID3v2_DEFAULT_MAGIC);
 
     return 0;
 }
@@ -141,11 +161,28 @@ static int adts_write_frame_header(ADTSContext *ctx,
 static int adts_write_packet(AVFormatContext *s, AVPacket *pkt)
 {
     ADTSContext *adts = s->priv_data;
+    AVCodecParameters *par = s->streams[0]->codecpar;
     AVIOContext *pb = s->pb;
     uint8_t buf[ADTS_HEADER_SIZE];
 
     if (!pkt->size)
         return 0;
+    if (!par->extradata_size) {
+        uint8_t *side_data;
+        int side_data_size, ret;
+
+        side_data = av_packet_get_side_data(pkt, AV_PKT_DATA_NEW_EXTRADATA,
+                                            &side_data_size);
+        if (side_data_size) {
+            ret = adts_decode_extradata(s, adts, side_data, side_data_size);
+            if (ret < 0)
+                return ret;
+            ret = ff_alloc_extradata(par, side_data_size);
+            if (ret < 0)
+                return ret;
+            memcpy(par->extradata, side_data, side_data_size);
+        }
+    }
     if (adts->write_adts) {
         int err = adts_write_frame_header(adts, buf, pkt->size,
                                              adts->pce_size);
@@ -158,10 +195,34 @@ static int adts_write_packet(AVFormatContext *s, AVPacket *pkt)
         }
     }
     avio_write(pb, pkt->data, pkt->size);
-    avio_flush(pb);
 
     return 0;
 }
+
+static int adts_write_trailer(AVFormatContext *s)
+{
+    ADTSContext *adts = s->priv_data;
+
+    if (adts->apetag)
+        ff_ape_write_tag(s);
+
+    return 0;
+}
+
+#define ENC AV_OPT_FLAG_ENCODING_PARAM
+#define OFFSET(obj) offsetof(ADTSContext, obj)
+static const AVOption options[] = {
+    { "write_id3v2",  "Enable ID3v2 tag writing", OFFSET(id3v2tag), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, ENC},
+    { "write_apetag", "Enable APE tag writing",   OFFSET(apetag),   AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, ENC},
+    { NULL },
+};
+
+static const AVClass adts_muxer_class = {
+    .class_name     = "ADTS muxer",
+    .item_name      = av_default_item_name,
+    .option         = options,
+    .version        = LIBAVUTIL_VERSION_INT,
+};
 
 AVOutputFormat ff_adts_muxer = {
     .name              = "adts",
@@ -171,6 +232,10 @@ AVOutputFormat ff_adts_muxer = {
     .priv_data_size    = sizeof(ADTSContext),
     .audio_codec       = AV_CODEC_ID_AAC,
     .video_codec       = AV_CODEC_ID_NONE,
+    .init              = adts_init,
     .write_header      = adts_write_header,
     .write_packet      = adts_write_packet,
+    .write_trailer     = adts_write_trailer,
+    .priv_class        = &adts_muxer_class,
+    .flags             = AVFMT_NOTIMESTAMPS,
 };

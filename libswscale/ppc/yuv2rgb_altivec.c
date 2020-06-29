@@ -89,7 +89,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
-#include <assert.h>
 
 #include "config.h"
 #include "libswscale/rgb2rgb.h"
@@ -99,6 +98,8 @@
 #include "libavutil/cpu.h"
 #include "libavutil/pixdesc.h"
 #include "yuv2rgb_altivec.h"
+
+#if HAVE_ALTIVEC
 
 #undef PROFILE_THE_BEAST
 #undef INC_SCALING
@@ -140,7 +141,6 @@ typedef signed char   sbyte;
  *           brgb|rgbr|gbrg|brgb
  *           1001 0010 0100 1001
  *           a67b 89cA BdCD eEFf
- *
  */
 static const vector unsigned char
     perm_rgb_0 = { 0x00, 0x01, 0x10, 0x02, 0x03, 0x11, 0x04, 0x05,
@@ -220,6 +220,7 @@ static const vector unsigned char
  * optimized for JPEG decoding.
  */
 
+#if HAVE_BIGENDIAN
 #define vec_unh(x)                                                      \
     (vector signed short)                                               \
         vec_perm(x, (__typeof__(x)) { 0 },                              \
@@ -233,6 +234,10 @@ static const vector unsigned char
                  ((vector unsigned char) {                              \
                      0x10, 0x08, 0x10, 0x09, 0x10, 0x0A, 0x10, 0x0B,    \
                      0x10, 0x0C, 0x10, 0x0D, 0x10, 0x0E, 0x10, 0x0F }))
+#else
+#define vec_unh(x)(vector signed short) vec_mergeh(x,(__typeof__(x)) { 0 })
+#define vec_unl(x)(vector signed short) vec_mergel(x,(__typeof__(x)) { 0 })
+#endif
 
 #define vec_clip_s16(x)                                                 \
     vec_max(vec_min(x, ((vector signed short) {                         \
@@ -245,8 +250,6 @@ static const vector unsigned char
                       vec_max(x, ((vector signed short) { 0 })),        \
                   (vector unsigned short)                               \
                       vec_max(y, ((vector signed short) { 0 })))
-
-//#define out_pixels(a, b, c, ptr) vec_mstrgb32(__typeof__(a), ((__typeof__(a)) { 255 }), a, a, a, ptr)
 
 static inline void cvtyuvtoRGB(SwsContext *c, vector signed short Y,
                                vector signed short U, vector signed short V,
@@ -302,9 +305,6 @@ static int altivec_ ## name(SwsContext *c, const unsigned char **in,          \
     vector signed short R1, G1, B1;                                           \
     vector unsigned char R, G, B;                                             \
                                                                               \
-    const vector unsigned char *y1ivP, *y2ivP, *uivP, *vivP;                  \
-    vector unsigned char align_perm;                                          \
-                                                                              \
     vector signed short lCY       = c->CY;                                    \
     vector signed short lOY       = c->OY;                                    \
     vector signed short lCRV      = c->CRV;                                   \
@@ -335,26 +335,13 @@ static int altivec_ ## name(SwsContext *c, const unsigned char **in,          \
         vec_dstst(oute, (0x02000002 | (((w * 3 + 32) / 32) << 16)), 1);       \
                                                                               \
         for (j = 0; j < w / 16; j++) {                                        \
-            y1ivP = (const vector unsigned char *) y1i;                       \
-            y2ivP = (const vector unsigned char *) y2i;                       \
-            uivP  = (const vector unsigned char *) ui;                        \
-            vivP  = (const vector unsigned char *) vi;                        \
+            y0 = vec_xl(0, y1i);                                              \
                                                                               \
-            align_perm = vec_lvsl(0, y1i);                                    \
-            y0 = (vector unsigned char)                                       \
-                     vec_perm(y1ivP[0], y1ivP[1], align_perm);                \
+            y1 = vec_xl(0, y2i);                                              \
                                                                               \
-            align_perm = vec_lvsl(0, y2i);                                    \
-            y1 = (vector unsigned char)                                       \
-                     vec_perm(y2ivP[0], y2ivP[1], align_perm);                \
+            u = (vector signed char) vec_xl(0, ui);                           \
                                                                               \
-            align_perm = vec_lvsl(0, ui);                                     \
-            u = (vector signed char)                                          \
-                    vec_perm(uivP[0], uivP[1], align_perm);                   \
-                                                                              \
-            align_perm = vec_lvsl(0, vi);                                     \
-            v = (vector signed char)                                          \
-                    vec_perm(vivP[0], vivP[1], align_perm);                   \
+            v = (vector signed char) vec_xl(0, vi);                           \
                                                                               \
             u = (vector signed char)                                          \
                     vec_sub(u,                                                \
@@ -526,14 +513,17 @@ static int altivec_uyvy_rgb32(SwsContext *c, const unsigned char **in,
     return srcSliceH;
 }
 
+#endif /* HAVE_ALTIVEC */
+
 /* Ok currently the acceleration routine only supports
  * inputs of widths a multiple of 16
  * and heights a multiple 2
  *
  * So we just fall back to the C codes for this.
  */
-av_cold SwsFunc ff_yuv2rgb_init_altivec(SwsContext *c)
+av_cold SwsFunc ff_yuv2rgb_init_ppc(SwsContext *c)
 {
+#if HAVE_ALTIVEC
     if (!(av_get_cpu_flags() & AV_CPU_FLAG_ALTIVEC))
         return NULL;
 
@@ -589,19 +579,25 @@ av_cold SwsFunc ff_yuv2rgb_init_altivec(SwsContext *c)
         }
         break;
     }
+#endif /* HAVE_ALTIVEC */
+
     return NULL;
 }
 
-av_cold void ff_yuv2rgb_init_tables_altivec(SwsContext *c,
-                                            const int inv_table[4],
-                                            int brightness,
-                                            int contrast,
-                                            int saturation)
+av_cold void ff_yuv2rgb_init_tables_ppc(SwsContext *c,
+                                        const int inv_table[4],
+                                        int brightness,
+                                        int contrast,
+                                        int saturation)
 {
+#if HAVE_ALTIVEC
     union {
         DECLARE_ALIGNED(16, signed short, tmp)[8];
         vector signed short vec;
     } buf;
+
+    if (!(av_get_cpu_flags() & AV_CPU_FLAG_ALTIVEC))
+        return;
 
     buf.tmp[0] = ((0xffffLL) * contrast >> 8) >> 9;                               // cy
     buf.tmp[1] = -256 * brightness;                                               // oy
@@ -618,20 +614,23 @@ av_cold void ff_yuv2rgb_init_tables_altivec(SwsContext *c,
     c->CGU    = vec_splat((vector signed short) buf.vec, 4);
     c->CGV    = vec_splat((vector signed short) buf.vec, 5);
     return;
+#endif /* HAVE_ALTIVEC */
 }
 
-static av_always_inline void ff_yuv2packedX_altivec(SwsContext *c,
-                                                    const int16_t *lumFilter,
-                                                    const int16_t **lumSrc,
-                                                    int lumFilterSize,
-                                                    const int16_t *chrFilter,
-                                                    const int16_t **chrUSrc,
-                                                    const int16_t **chrVSrc,
-                                                    int chrFilterSize,
-                                                    const int16_t **alpSrc,
-                                                    uint8_t *dest,
-                                                    int dstW, int dstY,
-                                                    enum AVPixelFormat target)
+#if HAVE_ALTIVEC
+
+static av_always_inline void yuv2packedX_altivec(SwsContext *c,
+                                                 const int16_t *lumFilter,
+                                                 const int16_t **lumSrc,
+                                                 int lumFilterSize,
+                                                 const int16_t *chrFilter,
+                                                 const int16_t **chrUSrc,
+                                                 const int16_t **chrVSrc,
+                                                 int chrFilterSize,
+                                                 const int16_t **alpSrc,
+                                                 uint8_t *dest,
+                                                 int dstW, int dstY,
+                                                 enum AVPixelFormat target)
 {
     int i, j;
     vector signed short X, X0, X1, Y0, U0, V0, Y1, U1, V1, U, V;
@@ -840,10 +839,10 @@ void ff_yuv2 ## suffix ## _X_altivec(SwsContext *c,                     \
                                      const int16_t **alpSrc,            \
                                      uint8_t *dest, int dstW, int dstY) \
 {                                                                       \
-    ff_yuv2packedX_altivec(c, lumFilter, lumSrc, lumFilterSize,         \
-                           chrFilter, chrUSrc, chrVSrc,                 \
-                           chrFilterSize, alpSrc,                       \
-                           dest, dstW, dstY, pixfmt);                   \
+    yuv2packedX_altivec(c, lumFilter, lumSrc, lumFilterSize,            \
+                        chrFilter, chrUSrc, chrVSrc,                    \
+                        chrFilterSize, alpSrc,                          \
+                        dest, dstW, dstY, pixfmt);                      \
 }
 
 YUV2PACKEDX_WRAPPER(abgr,  AV_PIX_FMT_ABGR);
@@ -852,3 +851,5 @@ YUV2PACKEDX_WRAPPER(argb,  AV_PIX_FMT_ARGB);
 YUV2PACKEDX_WRAPPER(rgba,  AV_PIX_FMT_RGBA);
 YUV2PACKEDX_WRAPPER(rgb24, AV_PIX_FMT_RGB24);
 YUV2PACKEDX_WRAPPER(bgr24, AV_PIX_FMT_BGR24);
+
+#endif /* HAVE_ALTIVEC */

@@ -1,6 +1,6 @@
 /*
  * AMR Audio encoder stub
- * Copyright (c) 2003 the ffmpeg project
+ * Copyright (c) 2003 The FFmpeg project
  *
  * This file is part of FFmpeg.
  *
@@ -45,13 +45,16 @@ static const AVOption options[] = {
     { NULL }
 };
 
-static const AVClass class = {
-    "libvo_amrwbenc", av_default_item_name, options, LIBAVUTIL_VERSION_INT
+static const AVClass amrwb_class = {
+    .class_name = "libvo_amrwbenc",
+    .item_name  = av_default_item_name,
+    .option     = options,
+    .version    = LIBAVUTIL_VERSION_INT,
 };
 
 static int get_wb_bitrate_mode(int bitrate, void *log_ctx)
 {
-    /* make the correspondance between bitrate and mode */
+    /* make the correspondence between bitrate and mode */
     static const int rates[] = {  6600,  8850, 12650, 14250, 15850, 18250,
                                  19850, 23050, 23850 };
     int i, best = -1, min_diff = 0;
@@ -93,12 +96,7 @@ static av_cold int amr_wb_encode_init(AVCodecContext *avctx)
     s->last_bitrate    = avctx->bit_rate;
 
     avctx->frame_size  = 320;
-    avctx->delay       =  80;
-#if FF_API_OLD_ENCODE_AUDIO
-    avctx->coded_frame = avcodec_alloc_frame();
-    if (!avctx->coded_frame)
-        return AVERROR(ENOMEM);
-#endif
+    avctx->initial_padding =  80;
 
     s->state     = E_IF_init();
 
@@ -110,7 +108,6 @@ static int amr_wb_encode_close(AVCodecContext *avctx)
     AMRWBContext *s = avctx->priv_data;
 
     E_IF_exit(s->state);
-    av_freep(&avctx->coded_frame);
     return 0;
 }
 
@@ -121,7 +118,7 @@ static int amr_wb_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
     const int16_t *samples = (const int16_t *)frame->data[0];
     int size, ret;
 
-    if ((ret = ff_alloc_packet2(avctx, avpkt, MAX_PACKET_SIZE)))
+    if ((ret = ff_alloc_packet2(avctx, avpkt, MAX_PACKET_SIZE, 0)) < 0)
         return ret;
 
     if (s->last_bitrate != avctx->bit_rate) {
@@ -135,7 +132,7 @@ static int amr_wb_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
     }
 
     if (frame->pts != AV_NOPTS_VALUE)
-        avpkt->pts = frame->pts - ff_samples_to_time_base(avctx, avctx->delay);
+        avpkt->pts = frame->pts - ff_samples_to_time_base(avctx, avctx->initial_padding);
 
     avpkt->size = size;
     *got_packet_ptr = 1;
@@ -144,6 +141,8 @@ static int amr_wb_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
 
 AVCodec ff_libvo_amrwbenc_encoder = {
     .name           = "libvo_amrwbenc",
+    .long_name      = NULL_IF_CONFIG_SMALL("Android VisualOn AMR-WB "
+                                           "(Adaptive Multi-Rate Wide-Band)"),
     .type           = AVMEDIA_TYPE_AUDIO,
     .id             = AV_CODEC_ID_AMR_WB,
     .priv_data_size = sizeof(AMRWBContext),
@@ -152,7 +151,6 @@ AVCodec ff_libvo_amrwbenc_encoder = {
     .close          = amr_wb_encode_close,
     .sample_fmts    = (const enum AVSampleFormat[]){ AV_SAMPLE_FMT_S16,
                                                      AV_SAMPLE_FMT_NONE },
-    .long_name      = NULL_IF_CONFIG_SMALL("Android VisualOn AMR-WB "
-                                           "(Adaptive Multi-Rate Wide-Band)"),
-    .priv_class     = &class,
+    .priv_class     = &amrwb_class,
+    .wrapper_name   = "libvo_amrwbenc",
 };

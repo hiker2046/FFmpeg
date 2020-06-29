@@ -28,17 +28,18 @@
  *     G. N. N. Martin                  Presented in March 1979 to the Video &
  *                                      Data Recording Conference,
  *     IBM UK Scientific Center         held in Southampton July 24-27 1979."
- *
  */
 
 #include <string.h>
 
+#include "libavutil/attributes.h"
 #include "libavutil/avassert.h"
+#include "libavutil/intreadwrite.h"
+
 #include "avcodec.h"
 #include "rangecoder.h"
-#include "bytestream.h"
 
-void ff_init_range_encoder(RangeCoder *c, uint8_t *buf, int buf_size)
+av_cold void ff_init_range_encoder(RangeCoder *c, uint8_t *buf, int buf_size)
 {
     c->bytestream_start  =
     c->bytestream        = buf;
@@ -49,12 +50,19 @@ void ff_init_range_encoder(RangeCoder *c, uint8_t *buf, int buf_size)
     c->outstanding_byte  = -1;
 }
 
-void ff_init_range_decoder(RangeCoder *c, const uint8_t *buf, int buf_size)
+av_cold void ff_init_range_decoder(RangeCoder *c, const uint8_t *buf,
+                                   int buf_size)
 {
     /* cast to avoid compiler warning */
     ff_init_range_encoder(c, (uint8_t *)buf, buf_size);
 
-    c->low = bytestream_get_be16((const uint8_t **)&c->bytestream);
+    c->low         = AV_RB16(c->bytestream);
+    c->bytestream += 2;
+    c->overread    = 0;
+    if (c->low >= 0xFF00) {
+        c->low = 0xFF00;
+        c->bytestream_end = c->bytestream;
+    }
 }
 
 void ff_build_rac_states(RangeCoder *c, int factor, int max_p)
@@ -98,8 +106,10 @@ void ff_build_rac_states(RangeCoder *c, int factor, int max_p)
 }
 
 /* Return the number of bytes written. */
-int ff_rac_terminate(RangeCoder *c)
+int ff_rac_terminate(RangeCoder *c, int version)
 {
+    if (version == 1)
+        put_rac(c, (uint8_t[]) { 129 }, 0);
     c->range = 0xFF;
     c->low  += 0xFF;
     renorm_encoder(c);
@@ -112,46 +122,21 @@ int ff_rac_terminate(RangeCoder *c)
     return c->bytestream - c->bytestream_start;
 }
 
-#ifdef TEST
-#define SIZE 10240
-
-#include "libavutil/lfg.h"
-#include "libavutil/log.h"
-
-int main(void)
+int ff_rac_check_termination(RangeCoder *c, int version)
 {
-    RangeCoder c;
-    uint8_t b[9 * SIZE];
-    uint8_t r[9 * SIZE];
-    int i;
-    uint8_t state[10];
-    AVLFG prng;
+    if (version == 1) {
+        RangeCoder tmp = *c;
+        get_rac(c, (uint8_t[]) { 129 });
 
-    av_lfg_init(&prng, 1);
+        if (c->bytestream == tmp.bytestream && c->bytestream > c->bytestream_start)
+            tmp.low -= *--tmp.bytestream;
+        tmp.bytestream_end = tmp.bytestream;
 
-    ff_init_range_encoder(&c, b, SIZE);
-    ff_build_rac_states(&c, 0.05 * (1LL << 32), 128 + 64 + 32 + 16);
-
-    memset(state, 128, sizeof(state));
-
-    for (i = 0; i < SIZE; i++)
-        r[i] = av_lfg_get(&prng) % 7;
-
-    for (i = 0; i < SIZE; i++)
-        put_rac(&c, state, r[i] & 1);
-
-    ff_rac_terminate(&c);
-
-    ff_init_range_decoder(&c, b, SIZE);
-
-    memset(state, 128, sizeof(state));
-
-    for (i = 0; i < SIZE; i++)
-        if ((r[i] & 1) != get_rac(&c, state)) {
-            av_log(NULL, AV_LOG_ERROR, "rac failure at %d\n", i);
-            return 1;
-        }
-
+        if (get_rac(&tmp, (uint8_t[]) { 129 }))
+            return AVERROR_INVALIDDATA;
+    } else {
+        if (c->bytestream_end != c->bytestream)
+            return AVERROR_INVALIDDATA;
+    }
     return 0;
 }
-#endif /* TEST */

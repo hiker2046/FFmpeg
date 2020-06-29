@@ -2,22 +2,24 @@
  * Sun Rasterfile (.sun/.ras/im{1,8,24}/.sunras) image encoder
  * Copyright (c) 2012 Aneesh Dogra (lionaneesh) <lionaneesh@gmail.com>
  *
- * This file is part of Libav.
+ * This file is part of FFmpeg.
  *
- * Libav is free software; you can redistribute it and/or
+ * FFmpeg is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
  * version 2.1 of the License, or (at your option) any later version.
  *
- * Libav is distributed in the hope that it will be useful,
+ * FFmpeg is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
  * Lesser General Public License for more details.
  *
  * You should have received a copy of the GNU Lesser General Public
- * License along with Libav; if not, write to the Free Software
+ * License along with FFmpeg; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
+
+#include "libavutil/opt.h"
 
 #include "avcodec.h"
 #include "bytestream.h"
@@ -25,7 +27,8 @@
 #include "sunrast.h"
 
 typedef struct SUNRASTContext {
-    AVFrame picture;
+    AVClass *class;
+
     PutByteContext p;
     int depth;      ///< depth of pixel
     int length;     ///< length (bytes) of image
@@ -137,6 +140,8 @@ static av_cold int sunrast_encode_init(AVCodecContext *avctx)
 {
     SUNRASTContext *s = avctx->priv_data;
 
+#if FF_API_CODER_TYPE
+FF_DISABLE_DEPRECATION_WARNINGS
     switch (avctx->coder_type) {
     case FF_CODER_TYPE_RLE:
         s->type = RT_BYTE_ENCODED;
@@ -148,10 +153,12 @@ static av_cold int sunrast_encode_init(AVCodecContext *avctx)
         av_log(avctx, AV_LOG_ERROR, "invalid coder_type\n");
         return AVERROR(EINVAL);
     }
+FF_ENABLE_DEPRECATION_WARNINGS
+    if (s->type != RT_BYTE_ENCODED && s->type != RT_STANDARD)
+#endif
+    // adjust boolean option to RT equivalent
+    s->type++;
 
-    avctx->coded_frame            = &s->picture;
-    avctx->coded_frame->key_frame = 1;
-    avctx->coded_frame->pict_type = AV_PICTURE_TYPE_I;
     s->maptype                    = RMT_NONE;
     s->maplength                  = 0;
 
@@ -162,6 +169,7 @@ static av_cold int sunrast_encode_init(AVCodecContext *avctx)
     case AV_PIX_FMT_PAL8 :
         s->maptype   = RMT_EQUAL_RGB;
         s->maplength = 3 * 256;
+        /* fall-through */
     case AV_PIX_FMT_GRAY8:
         s->depth = 8;
         break;
@@ -172,8 +180,7 @@ static av_cold int sunrast_encode_init(AVCodecContext *avctx)
         return AVERROR_BUG;
     }
     s->length = avctx->height * (FFALIGN(avctx->width * s->depth, 16) >> 3);
-    s->size   = 32 + s->maplength +
-                s->length * (s->type == RT_BYTE_ENCODED ? 2 : 1);
+    s->size   = 32 + s->maplength + s->length * s->type;
 
     return 0;
 }
@@ -184,7 +191,7 @@ static int sunrast_encode_frame(AVCodecContext *avctx,  AVPacket *avpkt,
     SUNRASTContext *s = avctx->priv_data;
     int ret;
 
-    if ((ret = ff_alloc_packet2(avctx, avpkt, s->size)) < 0)
+    if ((ret = ff_alloc_packet2(avctx, avpkt, s->size, 0)) < 0)
         return ret;
 
     bytestream2_init_writer(&s->p, avpkt->data, avpkt->size);
@@ -202,23 +209,43 @@ static int sunrast_encode_frame(AVCodecContext *avctx,  AVPacket *avpkt,
     return 0;
 }
 
+#define OFFSET(x) offsetof(SUNRASTContext, x)
+#define VE AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
+static const AVOption options[] = {
+    { "rle", "Use run-length compression", OFFSET(type), AV_OPT_TYPE_INT, { .i64 = 1 }, 0, 1, VE },
+
+    { NULL },
+};
+
+static const AVClass sunrast_class = {
+    .class_name = "sunrast",
+    .item_name  = av_default_item_name,
+    .option     = options,
+    .version    = LIBAVUTIL_VERSION_INT,
+};
+
+#if FF_API_CODER_TYPE
 static const AVCodecDefault sunrast_defaults[] = {
      { "coder", "rle" },
      { NULL },
 };
+#endif
 
 AVCodec ff_sunrast_encoder = {
     .name           = "sunrast",
+    .long_name      = NULL_IF_CONFIG_SMALL("Sun Rasterfile image"),
     .type           = AVMEDIA_TYPE_VIDEO,
     .id             = AV_CODEC_ID_SUNRAST,
     .priv_data_size = sizeof(SUNRASTContext),
     .init           = sunrast_encode_init,
     .encode2        = sunrast_encode_frame,
+#if FF_API_CODER_TYPE
     .defaults       = sunrast_defaults,
+#endif
+    .priv_class     = &sunrast_class,
     .pix_fmts       = (const enum AVPixelFormat[]){ AV_PIX_FMT_BGR24,
                                                   AV_PIX_FMT_PAL8,
                                                   AV_PIX_FMT_GRAY8,
                                                   AV_PIX_FMT_MONOWHITE,
                                                   AV_PIX_FMT_NONE },
-    .long_name      = NULL_IF_CONFIG_SMALL("Sun Rasterfile image"),
 };

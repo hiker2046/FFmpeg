@@ -31,7 +31,6 @@
 #include "config.h"
 #include "libavutil/common.h"
 #include "libavutil/avassert.h"
-#include "dsputil.h"
 
 /**
  * fill a rectangle.
@@ -47,7 +46,7 @@ static av_always_inline void fill_rectangle(void *vp, int w, int h, int stride, 
     w      *= size;
     stride *= size;
 
-    av_assert2((((long)vp)&(FFMIN(w, STRIDE_ALIGN)-1)) == 0);
+    av_assert2((((long)vp)&(FFMIN(w, 8<<(HAVE_NEON|ARCH_PPC|HAVE_MMX))-1)) == 0);
     av_assert2((stride&(w-1))==0);
     if(w==2){
         const uint16_t v= size==4 ? val : val*0x0101;
@@ -66,7 +65,7 @@ static av_always_inline void fill_rectangle(void *vp, int w, int h, int stride, 
         *(uint32_t*)(p + 2*stride)= v;
         *(uint32_t*)(p + 3*stride)= v;
     }else if(w==8){
-    //gcc can't optimize 64bit math on x86_32
+    // gcc cannot optimize 64-bit math on x86_32
 #if HAVE_FAST_64BIT
         const uint64_t v=  size==2 ? val*0x0001000100010001ULL : val*0x0100000001ULL;
         *(uint64_t*)(p + 0*stride)= v;

@@ -26,14 +26,13 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include <ctype.h>
 #include <string.h>
 
 #include "libavutil/mem.h"
 #include "libavutil/avstring.h"
 #include "urldecode.h"
 
-char *ff_urldecode(const char *url)
+char *ff_urldecode(const char *url, int decode_plus_sign)
 {
     int s = 0, d = 0, url_len = 0;
     char c;
@@ -54,7 +53,7 @@ char *ff_urldecode(const char *url)
         if (c == '%' && s + 2 < url_len) {
             char c2 = url[s++];
             char c3 = url[s++];
-            if (isxdigit(c2) && isxdigit(c3)) {
+            if (av_isxdigit(c2) && av_isxdigit(c3)) {
                 c2 = av_tolower(c2);
                 c3 = av_tolower(c3);
 
@@ -75,7 +74,7 @@ char *ff_urldecode(const char *url)
                 dest[d++] = c2;
                 dest[d++] = c3;
             }
-        } else if (c == '+') {
+        } else if (c == '+' && decode_plus_sign) {
             dest[d++] = ' ';
         } else {
             dest[d++] = c;

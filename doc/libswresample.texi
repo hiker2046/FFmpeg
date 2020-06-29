@@ -1,4 +1,5 @@
 \input texinfo @c -*- texinfo -*-
+@documentencoding UTF-8
 
 @settitle Libswresample Documentation
 @titlepage
@@ -20,7 +21,7 @@ Specifically, this library performs the following conversions:
 @itemize
 @item
 @emph{Resampling}: is the process of changing the audio rate, for
-example from an high sample rate of 44100Hz to 8000Hz. Audio
+example from a high sample rate of 44100Hz to 8000Hz. Audio
 conversion from high to low sample rate is a lossy process. Several
 resampling options and algorithms are available.
 
@@ -44,18 +45,26 @@ enabled through dedicated options.
 
 @c man end DESCRIPTION
 
+@chapter See Also
+
+@ifhtml
+@url{ffmpeg.html,ffmpeg}, @url{ffplay.html,ffplay}, @url{ffprobe.html,ffprobe},
+@url{ffmpeg-resampler.html,ffmpeg-resampler},
+@url{libavutil.html,libavutil}
+@end ifhtml
+
+@ifnothtml
+ffmpeg(1), ffplay(1), ffprobe(1),
+ffmpeg-resampler(1),
+libavutil(3)
+@end ifnothtml
+
+@include authors.texi
+
 @ignore
 
 @setfilename libswresample
 @settitle audio resampling library
-
-@c man begin SEEALSO
-ffmpeg(1), ffplay(1), ffprobe(1), ffserver(1), ffmpeg-resampler(1), libavutil(3)
-@c man end
-
-@c man begin AUTHORS
-See Git history (git://source.ffmpeg.org/ffmpeg)
-@c man end
 
 @end ignore
 

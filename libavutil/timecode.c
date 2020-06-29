@@ -35,18 +35,21 @@ int av_timecode_adjust_ntsc_framenum2(int framenum, int fps)
 {
     /* only works for NTSC 29.97 and 59.94 */
     int drop_frames = 0;
-    int d = framenum / 17982;
-    int m = framenum % 17982;
+    int d, m, frames_per_10mins;
 
-    if (fps == 30)
+    if (fps == 30) {
         drop_frames = 2;
-    else if (fps == 60)
+        frames_per_10mins = 17982;
+    } else if (fps == 60) {
         drop_frames = 4;
-    else
+        frames_per_10mins = 35964;
+    } else
         return framenum;
 
-    //if (m < 2) m += 2; /* not needed since -2,-1 / 1798 in C returns 0 */
-    return framenum + 9 * drop_frames * d + drop_frames * ((m - 2) / 1798);
+    d = framenum / frames_per_10mins;
+    m = framenum % frames_per_10mins;
+
+    return framenum + 9 * drop_frames * d + drop_frames * ((m - drop_frames) / (frames_per_10mins / 10));
 }
 
 uint32_t av_timecode_get_smpte_from_framenum(const AVTimecode *tc, int framenum)
@@ -76,6 +79,38 @@ uint32_t av_timecode_get_smpte_from_framenum(const AVTimecode *tc, int framenum)
            0         <<  6 | // BGF1
            (hh / 10) <<  4 | // tens  of hours
            (hh % 10);        // units of hours
+}
+
+uint32_t av_timecode_get_smpte(AVRational rate, int drop, int hh, int mm, int ss, int ff)
+{
+    uint32_t tc = 0;
+    uint32_t frames;
+
+    /* For SMPTE 12-M timecodes, frame count is a special case if > 30 FPS.
+       See SMPTE ST 12-1:2014 Sec 12.1 for more info. */
+    if (av_cmp_q(rate, (AVRational) {30, 1}) == 1) {
+        frames = ff / 2;
+        if (ff % 2 == 1) {
+            if (av_cmp_q(rate, (AVRational) {50, 1}) == 0)
+                tc |= (1 << 7);
+            else
+                tc |= (1 << 23);
+        }
+    } else {
+        frames = ff;
+    }
+
+    tc |= drop << 30;
+    tc |= (frames / 10) << 28;
+    tc |= (frames % 10) << 24;
+    tc |= (ss / 10) << 20;
+    tc |= (ss % 10) << 16;
+    tc |= (mm / 10) << 12;
+    tc |= (mm % 10) << 8;
+    tc |= (hh / 10) << 4;
+    tc |= (hh  % 10);
+
+    return tc;
 }
 
 char *av_timecode_make_string(const AVTimecode *tc, char *buf, int framenum)
@@ -126,7 +161,8 @@ char *av_timecode_make_smpte_tc_string(char *buf, uint32_t tcsmpte, int prevent_
 
 char *av_timecode_make_mpeg_tc_string(char *buf, uint32_t tc25bit)
 {
-    snprintf(buf, AV_TIMECODE_STR_SIZE, "%02u:%02u:%02u%c%02u",
+    snprintf(buf, AV_TIMECODE_STR_SIZE,
+             "%02"PRIu32":%02"PRIu32":%02"PRIu32"%c%02"PRIu32,
              tc25bit>>19 & 0x1f,              // 5-bit hours
              tc25bit>>13 & 0x3f,              // 6-bit minutes
              tc25bit>>6  & 0x3f,              // 6-bit seconds
@@ -138,7 +174,9 @@ char *av_timecode_make_mpeg_tc_string(char *buf, uint32_t tc25bit)
 static int check_fps(int fps)
 {
     int i;
-    static const int supported_fps[] = {24, 25, 30, 50, 60};
+    static const int supported_fps[] = {
+        24, 25, 30, 48, 50, 60, 100, 120, 150,
+    };
 
     for (i = 0; i < FF_ARRAY_ELEMS(supported_fps); i++)
         if (fps == supported_fps[i])
@@ -148,18 +186,17 @@ static int check_fps(int fps)
 
 static int check_timecode(void *log_ctx, AVTimecode *tc)
 {
-    if (tc->fps <= 0) {
-        av_log(log_ctx, AV_LOG_ERROR, "Timecode frame rate must be specified\n");
+    if ((int)tc->fps <= 0) {
+        av_log(log_ctx, AV_LOG_ERROR, "Valid timecode frame rate must be specified. Minimum value is 1\n");
         return AVERROR(EINVAL);
     }
-    if ((tc->flags & AV_TIMECODE_FLAG_DROPFRAME) && tc->fps != 30) {
-        av_log(log_ctx, AV_LOG_ERROR, "Drop frame is only allowed with 30000/1001 FPS\n");
+    if ((tc->flags & AV_TIMECODE_FLAG_DROPFRAME) && tc->fps != 30 && tc->fps != 60) {
+        av_log(log_ctx, AV_LOG_ERROR, "Drop frame is only allowed with 30000/1001 or 60000/1001 FPS\n");
         return AVERROR(EINVAL);
     }
     if (check_fps(tc->fps) < 0) {
-        av_log(log_ctx, AV_LOG_ERROR, "Timecode frame rate %d/%d not supported\n",
+        av_log(log_ctx, AV_LOG_WARNING, "Using non-standard frame rate %d/%d\n",
                tc->rate.num, tc->rate.den);
-        return AVERROR_PATCHWELCOME;
     }
     return 0;
 }
@@ -209,7 +246,7 @@ int av_timecode_init_from_string(AVTimecode *tc, AVRational rate, const char *st
     tc->start = (hh*3600 + mm*60 + ss) * tc->fps + ff;
     if (tc->flags & AV_TIMECODE_FLAG_DROPFRAME) { /* adjust frame number */
         int tmins = 60*hh + mm;
-        tc->start -= 2 * (tmins - tmins/10);
+        tc->start -= (tc->fps == 30 ? 2 : 4) * (tmins - tmins/10);
     }
     return 0;
 }

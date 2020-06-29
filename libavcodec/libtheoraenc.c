@@ -58,31 +58,26 @@ static int concatenate_packet(unsigned int* offset,
                               const ogg_packet* packet)
 {
     const char* message = NULL;
-    uint8_t* newdata    = NULL;
     int newsize = avc_context->extradata_size + 2 + packet->bytes;
-    int ret;
+    int err = AVERROR_INVALIDDATA;
 
     if (packet->bytes < 0) {
         message = "ogg_packet has negative size";
-        ret = AVERROR_INVALIDDATA;
     } else if (packet->bytes > 0xffff) {
         message = "ogg_packet is larger than 65535 bytes";
-        ret = AVERROR_INVALIDDATA;
     } else if (newsize < avc_context->extradata_size) {
         message = "extradata_size would overflow";
-        ret = AVERROR_INVALIDDATA;
     } else {
-        newdata = av_realloc(avc_context->extradata, newsize);
-        if (!newdata)
+        if ((err = av_reallocp(&avc_context->extradata, newsize)) < 0) {
+            avc_context->extradata_size = 0;
             message = "av_realloc failed";
-        ret = AVERROR(ENOMEM);
+        }
     }
     if (message) {
         av_log(avc_context, AV_LOG_ERROR, "concatenate_packet failed: %s\n", message);
-        return ret;
+        return err;
     }
 
-    avc_context->extradata      = newdata;
     avc_context->extradata_size = newsize;
     AV_WB16(avc_context->extradata + (*offset), packet->bytes);
     *offset += 2;
@@ -104,8 +99,11 @@ static int get_stats(AVCodecContext *avctx, int eos)
         return AVERROR_EXTERNAL;
     }
     if (!eos) {
-        h->stats = av_fast_realloc(h->stats, &h->stats_size,
+        void *tmp = av_fast_realloc(h->stats, &h->stats_size,
                                    h->stats_offset + bytes);
+        if (!tmp)
+            return AVERROR(ENOMEM);
+        h->stats = tmp;
         memcpy(h->stats + h->stats_offset, buf, bytes);
         h->stats_offset += bytes;
     } else {
@@ -113,6 +111,8 @@ static int get_stats(AVCodecContext *avctx, int eos)
         // libtheora generates a summary header at the end
         memcpy(h->stats, buf, bytes);
         avctx->stats_out = av_malloc(b64_size);
+        if (!avctx->stats_out)
+            return AVERROR(ENOMEM);
         av_base64_encode(avctx->stats_out, b64_size, h->stats, h->stats_offset);
     }
     return 0;
@@ -136,6 +136,10 @@ static int submit_stats(AVCodecContext *avctx)
         }
         h->stats_size = strlen(avctx->stats_in) * 3/4;
         h->stats      = av_malloc(h->stats_size);
+        if (!h->stats) {
+            h->stats_size = 0;
+            return AVERROR(ENOMEM);
+        }
         h->stats_size = av_base64_decode(h->stats, avctx->stats_in, h->stats_size);
     }
     while (h->stats_size - h->stats_offset > 0) {
@@ -204,15 +208,17 @@ static av_cold int encode_init(AVCodecContext* avc_context)
         av_log(avc_context, AV_LOG_ERROR, "Unsupported pix_fmt\n");
         return AVERROR(EINVAL);
     }
-    avcodec_get_chroma_sub_sample(avc_context->pix_fmt, &h->uv_hshift, &h->uv_vshift);
+    ret = av_pix_fmt_get_chroma_sub_sample(avc_context->pix_fmt, &h->uv_hshift, &h->uv_vshift);
+    if (ret)
+        return ret;
 
-    if (avc_context->flags & CODEC_FLAG_QSCALE) {
-        /* to be constant with the libvorbis implementation, clip global_quality to 0 - 10
-           Theora accepts a quality parameter p, which is:
-                * 0 <= p <=63
-                * an int value
-         */
-        t_info.quality        = av_clip(avc_context->global_quality / (float)FF_QP2LAMBDA, 0, 10) * 6.3;
+    if (avc_context->flags & AV_CODEC_FLAG_QSCALE) {
+        /* Clip global_quality in QP units to the [0 - 10] range
+           to be consistent with the libvorbis implementation.
+           Theora accepts a quality parameter which is an int value in
+           the [0 - 63] range.
+        */
+        t_info.quality        = av_clipf(avc_context->global_quality / (float)FF_QP2LAMBDA, 0, 10) * 6.3;
         t_info.target_bitrate = 0;
     } else {
         t_info.target_bitrate = avc_context->bit_rate;
@@ -237,10 +243,10 @@ static av_cold int encode_init(AVCodecContext* avc_context)
     }
 
     // need to enable 2 pass (via TH_ENCCTL_2PASS_) before encoding headers
-    if (avc_context->flags & CODEC_FLAG_PASS1) {
+    if (avc_context->flags & AV_CODEC_FLAG_PASS1) {
         if ((ret = get_stats(avc_context, 0)) < 0)
             return ret;
-    } else if (avc_context->flags & CODEC_FLAG_PASS2) {
+    } else if (avc_context->flags & AV_CODEC_FLAG_PASS2) {
         if ((ret = submit_stats(avc_context)) < 0)
             return ret;
     }
@@ -249,7 +255,7 @@ static av_cold int encode_init(AVCodecContext* avc_context)
         Output first header packet consisting of theora
         header, comment, and tables.
 
-        Each one is prefixed with a 16bit size, then they
+        Each one is prefixed with a 16-bit size, then they
         are concatenated together into libavcodec's extradata.
     */
     offset = 0;
@@ -262,9 +268,6 @@ static av_cold int encode_init(AVCodecContext* avc_context)
             return ret;
 
     th_comment_clear(&t_comment);
-
-    /* Set up the output AVFrame */
-    avc_context->coded_frame= avcodec_alloc_frame();
 
     return 0;
 }
@@ -280,7 +283,7 @@ static int encode_frame(AVCodecContext* avc_context, AVPacket *pkt,
     // EOS, finish and get 1st pass stats if applicable
     if (!frame) {
         th_encode_packetout(h->t_state, 1, &o_packet);
-        if (avc_context->flags & CODEC_FLAG_PASS1)
+        if (avc_context->flags & AV_CODEC_FLAG_PASS1)
             if ((ret = get_stats(avc_context, 1)) < 0)
                 return ret;
         return 0;
@@ -294,7 +297,7 @@ static int encode_frame(AVCodecContext* avc_context, AVPacket *pkt,
         t_yuv_buffer[i].data   = frame->data[i];
     }
 
-    if (avc_context->flags & CODEC_FLAG_PASS2)
+    if (avc_context->flags & AV_CODEC_FLAG_PASS2)
         if ((ret = submit_stats(avc_context)) < 0)
             return ret;
 
@@ -317,7 +320,7 @@ static int encode_frame(AVCodecContext* avc_context, AVPacket *pkt,
         return AVERROR_EXTERNAL;
     }
 
-    if (avc_context->flags & CODEC_FLAG_PASS1)
+    if (avc_context->flags & AV_CODEC_FLAG_PASS1)
         if ((ret = get_stats(avc_context, 0)) < 0)
             return ret;
 
@@ -336,15 +339,19 @@ static int encode_frame(AVCodecContext* avc_context, AVPacket *pkt,
     }
 
     /* Copy ogg_packet content out to buffer */
-    if ((ret = ff_alloc_packet2(avc_context, pkt, o_packet.bytes)) < 0)
+    if ((ret = ff_alloc_packet2(avc_context, pkt, o_packet.bytes, 0)) < 0)
         return ret;
     memcpy(pkt->data, o_packet.packet, o_packet.bytes);
 
     // HACK: assumes no encoder delay, this is true until libtheora becomes
-    // multithreaded (which will be disabled unless explictly requested)
+    // multithreaded (which will be disabled unless explicitly requested)
     pkt->pts = pkt->dts = frame->pts;
+#if FF_API_CODED_FRAME
+FF_DISABLE_DEPRECATION_WARNINGS
     avc_context->coded_frame->key_frame = !(o_packet.granulepos & h->keyframe_mask);
-    if (avc_context->coded_frame->key_frame)
+FF_ENABLE_DEPRECATION_WARNINGS
+#endif
+    if (!(o_packet.granulepos & h->keyframe_mask))
         pkt->flags |= AV_PKT_FLAG_KEY;
     *got_packet = 1;
 
@@ -357,7 +364,6 @@ static av_cold int encode_close(AVCodecContext* avc_context)
 
     th_encode_free(h->t_state);
     av_freep(&h->stats);
-    av_freep(&avc_context->coded_frame);
     av_freep(&avc_context->stats_out);
     av_freep(&avc_context->extradata);
     avc_context->extradata_size = 0;
@@ -368,15 +374,16 @@ static av_cold int encode_close(AVCodecContext* avc_context)
 /** AVCodec struct exposed to libavcodec */
 AVCodec ff_libtheora_encoder = {
     .name           = "libtheora",
+    .long_name      = NULL_IF_CONFIG_SMALL("libtheora Theora"),
     .type           = AVMEDIA_TYPE_VIDEO,
     .id             = AV_CODEC_ID_THEORA,
     .priv_data_size = sizeof(TheoraContext),
     .init           = encode_init,
     .close          = encode_close,
     .encode2        = encode_frame,
-    .capabilities   = CODEC_CAP_DELAY, // needed to get the statsfile summary
+    .capabilities   = AV_CODEC_CAP_DELAY, // needed to get the statsfile summary
     .pix_fmts       = (const enum AVPixelFormat[]){
         AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV422P, AV_PIX_FMT_YUV444P, AV_PIX_FMT_NONE
     },
-    .long_name      = NULL_IF_CONFIG_SMALL("libtheora Theora"),
+    .wrapper_name   = "libtheora",
 };

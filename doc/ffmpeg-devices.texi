@@ -1,4 +1,5 @@
 \input texinfo @c -*- texinfo -*-
+@documentencoding UTF-8
 
 @settitle FFmpeg Devices Documentation
 @titlepage
@@ -17,40 +18,25 @@ libavdevice library.
 
 @c man end DESCRIPTION
 
-@chapter Device Options
-@c man begin DEVICE OPTIONS
+@include devices.texi
 
-The libavdevice library provides the same interface as
-libavformat. Namely, an input device is considered like a demuxer, and
-an output device like a muxer, and the interface and generic device
-options are the same provided by libavformat (see the @ref{FFmpeg
-formats} manual page).
+@chapter See Also
 
-In addition each input or output device may support so-called private
-options, which are specific for that component.
+@ifhtml
+@url{ffmpeg.html,ffmpeg}, @url{ffplay.html,ffplay}, @url{ffprobe.html,ffprobe},
+@url{libavdevice.html,libavdevice}
+@end ifhtml
 
-Options may be set by specifying -@var{option} @var{value} in the
-FFmpeg tools, or by setting the value explicitly in the device
-@code{AVFormatContext} options or using the @file{libavutil/opt.h} API
-for programmatic use.
+@ifnothtml
+ffmpeg(1), ffplay(1), ffprobe(1), libavdevice(3)
+@end ifnothtml
 
-@c man end DEVICE OPTIONS
-
-@include indevs.texi
-@include outdevs.texi
+@include authors.texi
 
 @ignore
 
 @setfilename ffmpeg-devices
 @settitle FFmpeg devices
-
-@c man begin SEEALSO
-ffmpeg(1), ffplay(1), ffprobe(1), ffserver(1), libavformat(3), libavdevice(3)
-@c man end
-
-@c man begin AUTHORS
-See Git history (git://source.ffmpeg.org/ffmpeg)
-@c man end
 
 @end ignore
 

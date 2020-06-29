@@ -1,20 +1,20 @@
 /*
  * Copyright (c) 2011 Anton Khirnov
  *
- * This file is part of Libav.
+ * This file is part of FFmpeg.
  *
- * Libav is free software; you can redistribute it and/or
+ * FFmpeg is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
  * version 2.1 of the License, or (at your option) any later version.
  *
- * Libav is distributed in the hope that it will be useful,
+ * FFmpeg is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
  * Lesser General Public License for more details.
  *
  * You should have received a copy of the GNU Lesser General Public
- * License along with Libav; if not, write to the Free Software
+ * License along with FFmpeg; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
@@ -88,20 +88,22 @@ static void show_opts(const AVClass *class)
 
 static void show_format_opts(void)
 {
-    AVInputFormat *iformat = NULL;
-    AVOutputFormat *oformat = NULL;
+    const AVInputFormat *iformat = NULL;
+    const AVOutputFormat *oformat = NULL;
+    void *iformat_opaque = NULL;
+    void *oformat_opaque = NULL;
 
     printf("@section Generic format AVOptions\n");
     show_opts(avformat_get_class());
 
     printf("@section Format-specific AVOptions\n");
-    while ((iformat = av_iformat_next(iformat))) {
+    while ((iformat = av_demuxer_iterate(&iformat_opaque))) {
         if (!iformat->priv_class)
             continue;
         printf("@subsection %s AVOptions\n", iformat->priv_class->class_name);
         show_opts(iformat->priv_class);
     }
-    while ((oformat = av_oformat_next(oformat))) {
+    while ((oformat = av_muxer_iterate(&oformat_opaque))) {
         if (!oformat->priv_class)
             continue;
         printf("@subsection %s AVOptions\n", oformat->priv_class->class_name);
@@ -111,13 +113,14 @@ static void show_format_opts(void)
 
 static void show_codec_opts(void)
 {
+    void *iter = NULL;
     AVCodec *c = NULL;
 
     printf("@section Generic codec AVOptions\n");
     show_opts(avcodec_get_class());
 
     printf("@section Codec-specific AVOptions\n");
-    while ((c = av_codec_next(c))) {
+    while ((c = av_codec_iterate(&iter))) {
         if (!c->priv_class)
             continue;
         printf("@subsection %s AVOptions\n", c->priv_class->class_name);
@@ -129,8 +132,6 @@ int main(int argc, char **argv)
 {
     if (argc < 2)
         print_usage();
-
-    av_register_all();
 
     if (!strcmp(argv[1], "format"))
         show_format_opts();

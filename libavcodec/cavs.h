@@ -22,9 +22,12 @@
 #ifndef AVCODEC_CAVS_H
 #define AVCODEC_CAVS_H
 
-#include "dsputil.h"
-#include "mpegvideo.h"
 #include "cavsdsp.h"
+#include "blockdsp.h"
+#include "h264chroma.h"
+#include "idctdsp.h"
+#include "get_bits.h"
+#include "videodsp.h"
 
 #define SLICE_MAX_START_CODE    0x000001af
 #define EXT_START_CODE          0x000001b5
@@ -152,16 +155,27 @@ struct dec_2dvlc {
   int8_t max_run;
 };
 
+typedef struct AVSFrame {
+    AVFrame *f;
+    int poc;
+} AVSFrame;
+
 typedef struct AVSContext {
-    MpegEncContext s;
-    CAVSDSPContext cdsp;
-    Picture picture; ///< currently decoded frame
-    Picture DPB[2];  ///< reference frames
+    AVCodecContext *avctx;
+    BlockDSPContext bdsp;
+    H264ChromaContext h264chroma;
+    IDCTDSPContext idsp;
+    VideoDSPContext vdsp;
+    CAVSDSPContext  cdsp;
+    GetBitContext gb;
+    AVSFrame cur;     ///< currently decoded frame
+    AVSFrame DPB[2];  ///< reference frames
     int dist[2];     ///< temporal distances from current frame to ref frames
+    int low_delay;
     int profile, level;
     int aspect_ratio;
     int mb_width, mb_height;
-    int pic_type;
+    int width, height;
     int stream_revision; ///<0 for samples from 2006, 1 for rm52j encoder
     int progressive;
     int pic_structure;
@@ -198,10 +212,11 @@ typedef struct AVSContext {
        6:    A3  X2  X3   */
     int pred_mode_Y[3*3];
     int *top_pred_Y;
-    int l_stride, c_stride;
+    ptrdiff_t l_stride, c_stride;
     int luma_scan[4];
     int qp;
     int qp_fixed;
+    int pic_qp_fixed;
     int cbp;
     ScanTable scantable;
 
@@ -212,8 +227,8 @@ typedef struct AVSContext {
     uint8_t intern_border_y[26];
     uint8_t topleft_border_y, topleft_border_u, topleft_border_v;
 
-    void (*intra_pred_l[8])(uint8_t *d,uint8_t *top,uint8_t *left,int stride);
-    void (*intra_pred_c[7])(uint8_t *d,uint8_t *top,uint8_t *left,int stride);
+    void (*intra_pred_l[8])(uint8_t *d, uint8_t *top, uint8_t *left, ptrdiff_t stride);
+    void (*intra_pred_c[7])(uint8_t *d, uint8_t *top, uint8_t *left, ptrdiff_t stride);
     uint8_t *col_type_base;
 
     /* scaling factors for MV prediction */
@@ -221,10 +236,13 @@ typedef struct AVSContext {
     int direct_den[2]; ///< for scaling in direct B block
     int scale_den[2];  ///< for scaling neighbouring MVs
 
+    uint8_t *edge_emu_buffer;
+
     int got_keyframe;
-    DCTELEM *block;
+    int16_t *block;
 } AVSContext;
 
+extern const uint8_t     ff_cavs_chroma_qp[64];
 extern const uint8_t     ff_cavs_partition_flags[30];
 extern const cavs_vector ff_cavs_intra_mv;
 extern const cavs_vector ff_cavs_dir_mv;
@@ -253,8 +271,8 @@ void ff_cavs_mv(AVSContext *h, enum cavs_mv_loc nP, enum cavs_mv_loc nC,
                 enum cavs_mv_pred mode, enum cavs_block size, int ref);
 void ff_cavs_init_mb(AVSContext *h);
 int  ff_cavs_next_mb(AVSContext *h);
-void ff_cavs_init_pic(AVSContext *h);
-void ff_cavs_init_top_lines(AVSContext *h);
+int ff_cavs_init_pic(AVSContext *h);
+int ff_cavs_init_top_lines(AVSContext *h);
 int ff_cavs_init(AVCodecContext *avctx);
 int ff_cavs_end (AVCodecContext *avctx);
 

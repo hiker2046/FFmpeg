@@ -28,6 +28,7 @@
 #define APE_TAG_PREAMBLE        "APETAGEX"
 #define APE_TAG_VERSION         2000
 #define APE_TAG_FOOTER_BYTES    32
+#define APE_TAG_HEADER_BYTES    32
 
 /**
  * Read and parse an APE tag
@@ -37,8 +38,8 @@
 int64_t ff_ape_parse_tag(AVFormatContext *s);
 
 /**
- * Write an APEv2 tag
+ * Write an APE tag into a file.
  */
-void ff_ape_write(AVFormatContext *s);
+int ff_ape_write_tag(AVFormatContext *s);
 
 #endif /* AVFORMAT_APETAG_H */

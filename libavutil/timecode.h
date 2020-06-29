@@ -30,7 +30,7 @@
 #include <stdint.h>
 #include "rational.h"
 
-#define AV_TIMECODE_STR_SIZE 16
+#define AV_TIMECODE_STR_SIZE 23
 
 enum AVTimecodeFlag {
     AV_TIMECODE_FLAG_DROPFRAME      = 1<<0, ///< timecode is drop frame
@@ -69,6 +69,19 @@ int av_timecode_adjust_ntsc_framenum2(int framenum, int fps);
  *       correction (PC) bits are set to zero.
  */
 uint32_t av_timecode_get_smpte_from_framenum(const AVTimecode *tc, int framenum);
+
+/**
+ * Convert sei info to SMPTE 12M binary representation.
+ *
+ * @param rate     frame rate in rational form
+ * @param drop     drop flag
+ * @param hh       hour
+ * @param mm       minute
+ * @param ss       second
+ * @param ff       frame number
+ * @return         the SMPTE binary representation
+ */
+uint32_t av_timecode_get_smpte(AVRational rate, int drop, int hh, int mm, int ss, int ff);
 
 /**
  * Load timecode string in buf.

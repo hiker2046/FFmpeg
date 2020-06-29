@@ -19,18 +19,34 @@
  */
 
 #include "config.h"
+#include "libavutil/attributes.h"
 #include "libavutil/cpu.h"
 #include "libavutil/float_dsp.h"
+#include "libavutil/ppc/cpu.h"
 #include "float_dsp_altivec.h"
+#include "float_dsp_vsx.h"
 
-void ff_float_dsp_init_ppc(AVFloatDSPContext *fdsp, int bit_exact)
+av_cold void ff_float_dsp_init_ppc(AVFloatDSPContext *fdsp, int bit_exact)
 {
-#if HAVE_ALTIVEC
-    int mm_flags = av_get_cpu_flags();
+    if (PPC_ALTIVEC(av_get_cpu_flags())) {
+        fdsp->vector_fmul = ff_vector_fmul_altivec;
+        fdsp->vector_fmul_add = ff_vector_fmul_add_altivec;
+        fdsp->vector_fmul_reverse = ff_vector_fmul_reverse_altivec;
 
-    if (!(mm_flags & AV_CPU_FLAG_ALTIVEC))
-        return;
+        if (!bit_exact) {
+            fdsp->vector_fmul_window = ff_vector_fmul_window_altivec;
+        }
+    }
 
-    fdsp->vector_fmul = ff_vector_fmul_altivec;
-#endif
+    // The disabled function below are near identical to altivec and have
+    // been disabled to reduce code duplication
+    if (PPC_VSX(av_get_cpu_flags())) {
+//         fdsp->vector_fmul = ff_vector_fmul_vsx;
+        fdsp->vector_fmul_add = ff_vector_fmul_add_vsx;
+//         fdsp->vector_fmul_reverse = ff_vector_fmul_reverse_vsx;
+
+//         if (!bit_exact) {
+//             fdsp->vector_fmul_window = ff_vector_fmul_window_vsx;
+//         }
+    }
 }

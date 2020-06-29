@@ -27,32 +27,30 @@
 #include "avformat.h"
 #include "rtp.h"
 #include "url.h"
+#include "srtp.h"
 
 typedef struct PayloadContext PayloadContext;
 typedef struct RTPDynamicProtocolHandler RTPDynamicProtocolHandler;
 
 #define RTP_MIN_PACKET_LENGTH 12
-#define RTP_MAX_PACKET_LENGTH 1500
+#define RTP_MAX_PACKET_LENGTH 8192
 
-#define RTP_REORDER_QUEUE_DEFAULT_SIZE 10
+#define RTP_REORDER_QUEUE_DEFAULT_SIZE 500
 
 #define RTP_NOTS_VALUE ((uint32_t)-1)
 
 typedef struct RTPDemuxContext RTPDemuxContext;
 RTPDemuxContext *ff_rtp_parse_open(AVFormatContext *s1, AVStream *st,
-                                   URLContext *rtpc, int payload_type,
-                                   int queue_size);
+                                   int payload_type, int queue_size);
 void ff_rtp_parse_set_dynamic_protocol(RTPDemuxContext *s, PayloadContext *ctx,
-                                       RTPDynamicProtocolHandler *handler);
+                                       const RTPDynamicProtocolHandler *handler);
+void ff_rtp_parse_set_crypto(RTPDemuxContext *s, const char *suite,
+                             const char *params);
 int ff_rtp_parse_packet(RTPDemuxContext *s, AVPacket *pkt,
                         uint8_t **buf, int len);
 void ff_rtp_parse_close(RTPDemuxContext *s);
 int64_t ff_rtp_queued_packet_time(RTPDemuxContext *s);
 void ff_rtp_reset_packet_queue(RTPDemuxContext *s);
-int ff_rtp_get_local_rtp_port(URLContext *h);
-int ff_rtp_get_local_rtcp_port(URLContext *h);
-
-int ff_rtp_set_remote_url(URLContext *h, const char *uri);
 
 /**
  * Send a dummy packet on both port pairs to set up the connection
@@ -69,10 +67,13 @@ void ff_rtp_send_punch_packets(URLContext* rtp_handle);
 
 /**
  * some rtp servers assume client is dead if they don't hear from them...
- * so we send a Receiver Report to the provided ByteIO context
+ * so we send a Receiver Report to the provided URLContext or AVIOContext
  * (we don't have access to the rtcp handle from here)
  */
-int ff_rtp_check_and_send_back_rr(RTPDemuxContext *s, int count);
+int ff_rtp_check_and_send_back_rr(RTPDemuxContext *s, URLContext *fd,
+                                  AVIOContext *avio, int count);
+int ff_rtp_send_rtcp_feedback(RTPDemuxContext *s, URLContext *fd,
+                              AVIOContext *avio);
 
 // these statistics are used for rtcp receiver reports...
 typedef struct RTPStatistics {
@@ -81,9 +82,9 @@ typedef struct RTPStatistics {
     uint32_t base_seq;          ///< base sequence number
     uint32_t bad_seq;           ///< last bad sequence number + 1
     int probation;              ///< sequence packets till source is valid
-    int received;               ///< packets received
-    int expected_prior;         ///< packets expected in last interval
-    int received_prior;         ///< packets received in last interval
+    uint32_t received;          ///< packets received
+    uint32_t expected_prior;    ///< packets expected in last interval
+    uint32_t received_prior;    ///< packets received in last interval
     uint32_t transit;           ///< relative transit time for previous packet
     uint32_t jitter;            ///< estimated jitter.
 } RTPStatistics;
@@ -101,6 +102,7 @@ typedef struct RTPStatistics {
  *                  updated by the function if returning older, buffered data
  * @param buf pointer to raw RTP packet data
  * @param len length of buf
+ * @param seq RTP sequence number of the packet
  * @param flags flags from the RTP packet header (RTP_FLAG_*)
  */
 typedef int (*DynamicPayloadPacketHandlerProc)(AVFormatContext *ctx,
@@ -108,27 +110,30 @@ typedef int (*DynamicPayloadPacketHandlerProc)(AVFormatContext *ctx,
                                                AVStream *st, AVPacket *pkt,
                                                uint32_t *timestamp,
                                                const uint8_t * buf,
-                                               int len, int flags);
+                                               int len, uint16_t seq, int flags);
 
 struct RTPDynamicProtocolHandler {
-    const char enc_name[50];
+    const char *enc_name;
     enum AVMediaType codec_type;
     enum AVCodecID codec_id;
+    enum AVStreamParseType need_parsing;
     int static_payload_id; /* 0 means no payload id is set. 0 is a valid
                             * payload ID (PCMU), too, but that format doesn't
                             * require any custom depacketization code. */
+    int priv_data_size;
 
     /** Initialize dynamic protocol handler, called after the full rtpmap line is parsed, may be null */
     int (*init)(AVFormatContext *s, int st_index, PayloadContext *priv_data);
     /** Parse the a= line from the sdp field */
     int (*parse_sdp_a_line)(AVFormatContext *s, int st_index,
                             PayloadContext *priv_data, const char *line);
-    /** Allocate any data needed by the rtp parsing for this dynamic data. */
-    PayloadContext *(*alloc)(void);
-    /** Free any data needed by the rtp parsing for this dynamic data. */
-    void (*free)(PayloadContext *protocol_data);
+    /** Free any data needed by the rtp parsing for this dynamic data.
+      * Don't free the protocol_data pointer itself, that is freed by the
+      * caller. This is called even if the init method failed. */
+    void (*close)(PayloadContext *protocol_data);
     /** Parse handler for this dynamic packet */
     DynamicPayloadPacketHandlerProc parse_packet;
+    int (*need_keyframe)(PayloadContext *context);
 
     struct RTPDynamicProtocolHandler *next;
 };
@@ -149,16 +154,14 @@ struct RTPDemuxContext {
     uint16_t seq;
     uint32_t timestamp;
     uint32_t base_timestamp;
-    uint32_t cur_timestamp;
     int64_t  unwrapped_timestamp;
     int64_t  range_start_offset;
     int max_payload_size;
-    struct MpegTSContext *ts;   /* only used for MP2T payloads */
-    int read_buf_index;
-    int read_buf_size;
     /* used to send back RTCP RR */
-    URLContext *rtp_ctx;
     char hostname[256];
+
+    int srtp_enabled;
+    struct SRTPContext srtp;
 
     /** Statistics for this stream (used by RTCP receiver reports) */
     RTPStatistics statistics;
@@ -171,8 +174,9 @@ struct RTPDemuxContext {
     /*@}*/
 
     /* rtcp sender statistics receive */
-    int64_t last_rtcp_ntp_time;
-    int64_t first_rtcp_ntp_time;
+    uint64_t last_rtcp_ntp_time;
+    int64_t last_rtcp_reception_time;
+    uint64_t first_rtcp_ntp_time;
     uint32_t last_rtcp_timestamp;
     int64_t rtcp_ts_offset;
 
@@ -180,30 +184,50 @@ struct RTPDemuxContext {
     unsigned int packet_count;
     unsigned int octet_count;
     unsigned int last_octet_count;
-    /* buffer for partially parsed packets */
-    uint8_t buf[RTP_MAX_PACKET_LENGTH];
+    int64_t last_feedback_time;
 
     /* dynamic payload stuff */
-    DynamicPayloadPacketHandlerProc parse_packet;
+    const RTPDynamicProtocolHandler *handler;
     PayloadContext *dynamic_protocol_context;
 };
 
-void ff_register_dynamic_payload_handler(RTPDynamicProtocolHandler *handler);
-RTPDynamicProtocolHandler *ff_rtp_handler_find_by_name(const char *name,
+/**
+ * Iterate over all registered rtp dynamic protocol handlers.
+ *
+ * @param opaque a pointer where libavformat will store the iteration state. Must
+ *               point to NULL to start the iteration.
+ *
+ * @return the next registered rtp dynamic protocol handler or NULL when the iteration is
+ *         finished
+ */
+const RTPDynamicProtocolHandler *ff_rtp_handler_iterate(void **opaque);
+/**
+ * Find a registered rtp dynamic protocol handler with the specified name.
+ *
+ * @param name name of the requested rtp dynamic protocol handler
+ * @return A rtp dynamic protocol handler if one was found, NULL otherwise.
+ */
+const RTPDynamicProtocolHandler *ff_rtp_handler_find_by_name(const char *name,
                                                   enum AVMediaType codec_type);
-RTPDynamicProtocolHandler *ff_rtp_handler_find_by_id(int id,
+/**
+ * Find a registered rtp dynamic protocol handler with a matching codec ID.
+ *
+ * @param id AVCodecID of the requested rtp dynamic protocol handler.
+ * @return A rtp dynamic protocol handler if one was found, NULL otherwise.
+ */
+const RTPDynamicProtocolHandler *ff_rtp_handler_find_by_id(int id,
                                                 enum AVMediaType codec_type);
 
 /* from rtsp.c, but used by rtp dynamic protocol handlers. */
 int ff_rtsp_next_attr_and_value(const char **p, char *attr, int attr_size,
                                 char *value, int value_size);
 
-int ff_parse_fmtp(AVStream *stream, PayloadContext *data, const char *p,
-                  int (*parse_fmtp)(AVStream *stream,
+int ff_parse_fmtp(AVFormatContext *s,
+                  AVStream *stream, PayloadContext *data, const char *p,
+                  int (*parse_fmtp)(AVFormatContext *s,
+                                    AVStream *stream,
                                     PayloadContext *data,
-                                    char *attr, char *value));
-
-void av_register_rtp_dynamic_payload_handlers(void);
+                                    const char *attr, const char *value));
 
 /**
  * Close the dynamic buffer and make a packet from it.

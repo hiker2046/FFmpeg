@@ -1,20 +1,20 @@
 /*
  * Copyright (c) 2012 Anton Khirnov
  *
- * This file is part of Libav.
+ * This file is part of FFmpeg.
  *
- * Libav is free software; you can redistribute it and/or
+ * FFmpeg is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
  * version 2.1 of the License, or (at your option) any later version.
  *
- * Libav is distributed in the hope that it will be useful,
+ * FFmpeg is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
  * Lesser General Public License for more details.
  *
  * You should have received a copy of the GNU Lesser General Public
- * License along with Libav; if not, write to the Free Software
+ * License along with FFmpeg; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
@@ -23,12 +23,24 @@
  */
 
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 #include <float.h>
 
-#include "libavformat/avformat.h"
-#include "libavcodec/avcodec.h"
+// print_options is build for the host, os_support.h isn't needed and is setup
+// for the target. without this build breaks on mingw
+#define AVFORMAT_OS_SUPPORT_H
+
+#include "libavutil/attributes.h"
 #include "libavutil/opt.h"
+
+/* Forcibly turn off deprecation warnings, which just add noise here. */
+#undef attribute_deprecated
+#define attribute_deprecated
+
+#include "libavcodec/options_table.h"
+
+#include "libavformat/options_table.h"
 
 static void print_usage(void)
 {
@@ -39,6 +51,9 @@ static void print_usage(void)
 
 static void print_option(const AVOption *opts, const AVOption *o, int per_stream)
 {
+    if (!(o->flags & (AV_OPT_FLAG_DECODING_PARAM | AV_OPT_FLAG_ENCODING_PARAM)))
+        return;
+
     printf("@item -%s%s @var{", o->name, per_stream ? "[:stream_specifier]" : "");
     switch (o->type) {
     case AV_OPT_TYPE_BINARY:   printf("hexadecimal string"); break;
@@ -93,18 +108,14 @@ static void show_opts(const AVOption *opts, int per_stream)
 
 static void show_format_opts(void)
 {
-#include "libavformat/options_table.h"
-
     printf("@section Format AVOptions\n");
-    show_opts(options, 0);
+    show_opts(avformat_options, 0);
 }
 
 static void show_codec_opts(void)
 {
-#include "libavcodec/options_table.h"
-
     printf("@section Codec AVOptions\n");
-    show_opts(options, 1);
+    show_opts(avcodec_options, 1);
 }
 
 int main(int argc, char **argv)

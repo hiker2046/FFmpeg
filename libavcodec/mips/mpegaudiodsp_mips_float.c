@@ -55,10 +55,14 @@
 
 #include <string.h>
 
+#include "libavutil/mips/asmdefs.h"
 #include "libavcodec/mpegaudiodsp.h"
 
+#if HAVE_INLINE_ASM && HAVE_MIPSFPU
+#if !HAVE_MIPS32R6 && !HAVE_MIPS64R6
+
 static void ff_mpadsp_apply_window_mips_float(float *synth_buf, float *window,
-                               int *dither_state, float *samples, int incr)
+                               int *dither_state, float *samples, ptrdiff_t incr)
 {
     register const float *w, *w2, *p;
     int j;
@@ -89,7 +93,7 @@ static void ff_mpadsp_apply_window_mips_float(float *synth_buf, float *window,
         "sw      $zero,       0(%[dither_state])                            \t\n"
         "lwc1    %[in3],      64*4(%[window])                               \t\n"
         "lwc1    %[in4],      80*4(%[synth_buf])                            \t\n"
-        "addu    %[samples2], %[samples],   %[t_sample]                     \t\n"
+        PTR_ADDU "%[samples2],%[samples],   %[t_sample]                     \t\n"
         "madd.s  %[sum],      %[sum],       %[in1], %[in2]                  \t\n"
         "lwc1    %[in5],      128*4(%[window])                              \t\n"
         "lwc1    %[in6],      144*4(%[synth_buf])                           \t\n"
@@ -131,15 +135,15 @@ static void ff_mpadsp_apply_window_mips_float(float *synth_buf, float *window,
         "lwc1    %[in7],      480*4(%[window])                              \t\n"
         "lwc1    %[in8],      496*4(%[synth_buf])                           \t\n"
         "nmsub.s %[sum],      %[sum],       %[in1], %[in2]                  \t\n"
-        "addu    %[w],        %[window],    4                               \t\n"
+        PTR_ADDU "%[w],       %[window],    4                               \t\n"
         "nmsub.s %[sum],      %[sum],       %[in3], %[in4]                  \t\n"
-        "addu    %[w2],       %[window],    124                             \t\n"
-        "addiu   %[p],        %[synth_buf], 68                              \t\n"
-        "addiu   %[p2],       %[synth_buf], 188                             \t\n"
+        PTR_ADDU "%[w2],      %[window],    124                             \t\n"
+        PTR_ADDIU "%[p],      %[synth_buf], 68                              \t\n"
+        PTR_ADDIU "%[p2],     %[synth_buf], 188                             \t\n"
         "nmsub.s %[sum],      %[sum],       %[in5], %[in6]                  \t\n"
         "nmsub.s %[sum],      %[sum],       %[in7], %[in8]                  \t\n"
         "swc1    %[sum],      0(%[samples])                                 \t\n"
-        "addu    %[samples],  %[samples],   %[incr1]                        \t\n"
+        PTR_ADDU "%[samples], %[samples],   %[incr1]                        \t\n"
 
         /* calculate two samples at the same time to avoid one memory
            access per two sample */
@@ -223,17 +227,17 @@ static void ff_mpadsp_apply_window_mips_float(float *synth_buf, float *window,
         "nmsub.s %[sum],      %[sum],       %[in1], %[in2]                  \t\n"
         "lwc1    %[in6],      480*4(%[w2])                                  \t\n"
         "nmsub.s %[sum2],     %[sum2],      %[in2], %[in3]                  \t\n"
-        "addiu   %[w],        %[w],         4                               \t\n"
+        PTR_ADDIU "%[w],      %[w],         4                               \t\n"
         "nmsub.s %[sum],      %[sum],       %[in4], %[in5]                  \t\n"
-        "addiu   %[w2],       %[w2],        -4                              \t\n"
+        PTR_ADDIU "%[w2],     %[w2],        -4                              \t\n"
         "nmsub.s %[sum2],     %[sum2],      %[in5], %[in6]                  \t\n"
         "addu    %[j],        %[j],         4                               \t\n"
-        "addiu   %[p],        4                                             \t\n"
+        PTR_ADDIU "%[p],      4                                             \t\n"
         "swc1    %[sum],      0(%[samples])                                 \t\n"
-        "addiu   %[p2],       -4                                            \t\n"
+        PTR_ADDIU "%[p2],     -4                                            \t\n"
         "swc1    %[sum2],     0(%[samples2])                                \t\n"
-        "addu    %[samples],  %[samples],   %[incr1]                        \t\n"
-        "subu    %[samples2], %[samples2],  %[incr1]                        \t\n"
+        PTR_ADDU "%[samples], %[samples],   %[incr1]                        \t\n"
+        PTR_SUBU "%[samples2],%[samples2],  %[incr1]                        \t\n"
         "bne     %[j],        64,           ff_mpadsp_apply_window_loop%=   \t\n"
 
         "lwc1    %[in1],      48*4(%[window])                               \t\n"
@@ -273,6 +277,7 @@ static void ff_mpadsp_apply_window_mips_float(float *synth_buf, float *window,
           [t_sample] "=&r" (t_sample)
         : [synth_buf] "r" (synth_buf), [window] "r" (window),
           [dither_state] "r" (dither_state), [incr1] "r" (incr1)
+        : "memory"
     );
 }
 
@@ -348,6 +353,7 @@ static void ff_dct32_mips_float(float *out, const float *tab)
           [val16] "=f" (val16), [val23] "=f" (val23),
           [val24] "=f" (val24), [val31] "=f" (val31)
         : [tab] "r" (tab)
+        : "memory"
     );
 
     __asm__ volatile (
@@ -410,6 +416,7 @@ static void ff_dct32_mips_float(float *out, const float *tab)
           [val19] "=f" (val19), [val20] "=f" (val20),
           [val27] "=f" (val27), [val28] "=f" (val28)
         : [tab] "r" (tab)
+        : "memory"
     );
 
     __asm__ volatile (
@@ -517,6 +524,7 @@ static void ff_dct32_mips_float(float *out, const float *tab)
           [val17] "=f" (val17), [val22] "=f" (val22),
           [val25] "=f" (val25), [val30] "=f" (val30)
         : [tab] "r" (tab)
+        : "memory"
     );
 
     __asm__ volatile (
@@ -579,6 +587,7 @@ static void ff_dct32_mips_float(float *out, const float *tab)
           [val18] "=f" (val18), [val21] "=f" (val21),
           [val26] "=f" (val26), [val29] "=f" (val29)
         : [tab] "r" (tab)
+        : "memory"
     );
 
     __asm__ volatile (
@@ -868,6 +877,7 @@ static void imdct36_mips_float(float *out, float *buf, float *in, float *win)
           [out3] "=&f" (out3), [out4] "=&f" (out4),
           [out5] "=&f" (out5)
         : [in] "r" (in)
+        : "memory"
     );
 
     /* loop 3 */
@@ -999,6 +1009,7 @@ static void imdct36_mips_float(float *out, float *buf, float *in, float *win)
           [c7] "=&f" (c7), [c8] "=&f" (c8),
           [c9] "=&f" (c9)
         : [in] "r" (in), [tmp] "r" (tmp)
+        : "memory"
     );
 
     /* loop 4 */
@@ -1212,6 +1223,7 @@ static void imdct36_mips_float(float *out, float *buf, float *in, float *win)
           [s2] "=&f" (s2), [s3] "=&f" (s3)
         : [tmp] "r" (tmp), [win] "r" (win),
           [buf] "r" (buf), [out] "r" (out)
+        : "memory"
     );
 }
 
@@ -1234,9 +1246,16 @@ static void ff_imdct36_blocks_mips_float(float *out, float *buf, float *in,
     }
 }
 
+#endif /* !HAVE_MIPS32R6 && !HAVE_MIPS64R6 */
+#endif /* HAVE_INLINE_ASM && HAVE_MIPSFPU */
+
 void ff_mpadsp_init_mipsfpu(MPADSPContext *s)
 {
+#if HAVE_INLINE_ASM && HAVE_MIPSFPU
+#if !HAVE_MIPS32R6 && !HAVE_MIPS64R6
     s->apply_window_float   = ff_mpadsp_apply_window_mips_float;
     s->imdct36_blocks_float = ff_imdct36_blocks_mips_float;
     s->dct32_float          = ff_dct32_mips_float;
+#endif
+#endif
 }

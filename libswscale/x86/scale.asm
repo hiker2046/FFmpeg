@@ -2,20 +2,20 @@
 ;* x86-optimized horizontal line scaling functions
 ;* Copyright (c) 2011 Ronald S. Bultje <rsbultje@gmail.com>
 ;*
-;* This file is part of Libav.
+;* This file is part of FFmpeg.
 ;*
-;* Libav is free software; you can redistribute it and/or
+;* FFmpeg is free software; you can redistribute it and/or
 ;* modify it under the terms of the GNU Lesser General Public
 ;* License as published by the Free Software Foundation; either
 ;* version 2.1 of the License, or (at your option) any later version.
 ;*
-;* Libav is distributed in the hope that it will be useful,
+;* FFmpeg is distributed in the hope that it will be useful,
 ;* but WITHOUT ANY WARRANTY; without even the implied warranty of
 ;* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
 ;* Lesser General Public License for more details.
 ;*
 ;* You should have received a copy of the GNU Lesser General Public
-;* License along with Libav; if not, write to the Free Software
+;* License along with FFmpeg; if not, write to the Free Software
 ;* Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
 ;******************************************************************************
 
@@ -39,10 +39,10 @@ SECTION .text
 ;                                const int16_t *filter,
 ;                                const int32_t *filterPos, int filterSize);
 ;
-; Scale one horizontal line. Input is either 8-bits width or 16-bits width
+; Scale one horizontal line. Input is either 8-bit width or 16-bit width
 ; ($source_width can be either 8, 9, 10 or 16, difference is whether we have to
-; downscale before multiplying). Filter is 14-bits. Output is either 15bits
-; (in int16_t) or 19bits (in int32_t), as given in $intermediate_nbits. Each
+; downscale before multiplying). Filter is 14 bits. Output is either 15 bits
+; (in int16_t) or 19 bits (in int32_t), as given in $intermediate_nbits. Each
 ; output pixel is generated from $filterSize input pixels, the position of
 ; the first pixel is given in filterPos[nOutputPixel].
 ;-----------------------------------------------------------------------------
@@ -364,15 +364,7 @@ cglobal hscale%1to%2_%4, %5, 10, %6, pos0, dst, w, srcmem, filter, fltpos, fltsi
     movd [dstq+wq*2], m0
 %endif ; %3 ==/!= X
 %else ; %2 == 19
-%if mmsize == 8
-    PMINSD_MMX    m0, m2, m4
-%elif cpuflag(sse4)
-    pminsd        m0, m2
-%else ; sse2/ssse3
-    cvtdq2ps      m0, m0
-    minps         m0, m2
-    cvtps2dq      m0, m0
-%endif ; mmx/sse2/ssse3/sse4
+    PMINSD        m0, m2, m4
 %ifnidn %3, X
     mova [dstq+wq*(4>>wshr)], m0
 %else ; %3 == X
@@ -424,7 +416,7 @@ INIT_MMX mmx
 SCALE_FUNCS2 0, 0, 0
 %endif
 INIT_XMM sse2
-SCALE_FUNCS2 6, 7, 8
+SCALE_FUNCS2 7, 6, 8
 INIT_XMM ssse3
 SCALE_FUNCS2 6, 6, 8
 INIT_XMM sse4

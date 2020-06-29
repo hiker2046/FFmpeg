@@ -35,13 +35,14 @@ typedef struct {
     FFDemuxSubtitlesQueue q;
 } RealTextContext;
 
-static int realtext_probe(AVProbeData *p)
+static int realtext_probe(const AVProbeData *p)
 {
-    const unsigned char *ptr = p->buf;
+    char buf[7];
+    FFTextReader tr;
+    ff_text_init_buf(&tr, p->buf, p->buf_size);
+    ff_text_read(&tr, buf, sizeof(buf));
 
-    if (AV_RB24(ptr) == 0xEFBBBF)
-        ptr += 3;  /* skip UTF-8 BOM */
-    return !av_strncasecmp(ptr, "<window", 7) ? AVPROBE_SCORE_MAX/2 : 0;
+    return !av_strncasecmp(buf, "<window", 7) ? AVPROBE_SCORE_EXTENSION : 0;
 }
 
 static int read_ts(const char *s)
@@ -63,19 +64,21 @@ static int realtext_read_header(AVFormatContext *s)
     AVBPrint buf;
     char c = 0;
     int res = 0, duration = read_ts("60"); // default duration is 60 seconds
+    FFTextReader tr;
+    ff_text_init_avio(s, &tr, s->pb);
 
     if (!st)
         return AVERROR(ENOMEM);
     avpriv_set_pts_info(st, 64, 1, 100);
-    st->codec->codec_type = AVMEDIA_TYPE_SUBTITLE;
-    st->codec->codec_id   = AV_CODEC_ID_REALTEXT;
+    st->codecpar->codec_type = AVMEDIA_TYPE_SUBTITLE;
+    st->codecpar->codec_id   = AV_CODEC_ID_REALTEXT;
 
     av_bprint_init(&buf, 0, AV_BPRINT_SIZE_UNLIMITED);
 
-    while (!url_feof(s->pb)) {
+    while (!ff_text_eof(&tr)) {
         AVPacket *sub;
-        const int64_t pos = avio_tell(s->pb) - (c != 0);
-        int n = ff_smil_extract_next_chunk(s->pb, &buf, &c);
+        const int64_t pos = ff_text_pos(&tr) - (c != 0);
+        int n = ff_smil_extract_next_text_chunk(&tr, &buf, &c);
 
         if (n == 0)
             break;
@@ -84,14 +87,18 @@ static int realtext_read_header(AVFormatContext *s)
             /* save header to extradata */
             const char *p = ff_smil_get_attr_ptr(buf.str, "duration");
 
+            if (st->codecpar->extradata) {
+                res = AVERROR_INVALIDDATA;
+                goto end;
+            }
             if (p)
                 duration = read_ts(p);
-            st->codec->extradata = av_strdup(buf.str);
-            if (!st->codec->extradata) {
+            st->codecpar->extradata = av_strdup(buf.str);
+            if (!st->codecpar->extradata) {
                 res = AVERROR(ENOMEM);
                 goto end;
             }
-            st->codec->extradata_size = buf.len + 1;
+            st->codecpar->extradata_size = buf.len + 1;
         } else {
             /* if we just read a <time> tag, introduce a new event, otherwise merge
              * with the previous one */
@@ -112,10 +119,12 @@ static int realtext_read_header(AVFormatContext *s)
         }
         av_bprint_clear(&buf);
     }
-    ff_subtitles_queue_finalize(&rt->q);
+    ff_subtitles_queue_finalize(s, &rt->q);
 
 end:
     av_bprint_finalize(&buf, NULL);
+    if (res < 0)
+        ff_subtitles_queue_clean(&rt->q);
     return res;
 }
 
@@ -149,6 +158,5 @@ AVInputFormat ff_realtext_demuxer = {
     .read_packet    = realtext_read_packet,
     .read_seek2     = realtext_read_seek,
     .read_close     = realtext_read_close,
-    .flags          = AVFMT_GENERIC_INDEX,
     .extensions     = "rt",
 };

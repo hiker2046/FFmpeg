@@ -29,29 +29,32 @@
  */
 
 #include "avcodec.h"
+#include "blockdsp.h"
+#include "bytestream.h"
+#include "bswapdsp.h"
 #include "get_bits.h"
-#include "dsputil.h"
 #include "aandcttab.h"
 #include "eaidct.h"
+#include "idctdsp.h"
 #include "internal.h"
-#include "mpeg12.h"
 #include "mpeg12data.h"
-#include "libavutil/imgutils.h"
+#include "mpeg12vlc.h"
 
 #define EA_PREAMBLE_SIZE    8
-#define MADk_TAG MKTAG('M', 'A', 'D', 'k')    /* MAD i-frame */
-#define MADm_TAG MKTAG('M', 'A', 'D', 'm')    /* MAD p-frame */
+#define MADk_TAG MKTAG('M', 'A', 'D', 'k')    /* MAD I-frame */
+#define MADm_TAG MKTAG('M', 'A', 'D', 'm')    /* MAD P-frame */
 #define MADe_TAG MKTAG('M', 'A', 'D', 'e')    /* MAD lqp-frame */
 
 typedef struct MadContext {
     AVCodecContext *avctx;
-    DSPContext dsp;
-    AVFrame frame;
-    AVFrame last_frame;
+    BlockDSPContext bdsp;
+    BswapDSPContext bbdsp;
+    IDCTDSPContext idsp;
+    AVFrame *last_frame;
     GetBitContext gb;
     void *bitstream_buf;
     unsigned int bitstream_buf_size;
-    DECLARE_ALIGNED(16, DCTELEM, block)[64];
+    DECLARE_ALIGNED(32, int16_t, block)[64];
     ScanTable scantable;
     uint16_t quant_matrix[64];
     int mb_x;
@@ -63,15 +66,22 @@ static av_cold int decode_init(AVCodecContext *avctx)
     MadContext *s = avctx->priv_data;
     s->avctx = avctx;
     avctx->pix_fmt = AV_PIX_FMT_YUV420P;
-    ff_dsputil_init(&s->dsp, avctx);
-    ff_init_scantable_permutation(s->dsp.idct_permutation, FF_NO_IDCT_PERM);
-    ff_init_scantable(s->dsp.idct_permutation, &s->scantable, ff_zigzag_direct);
+    ff_blockdsp_init(&s->bdsp, avctx);
+    ff_bswapdsp_init(&s->bbdsp);
+    ff_idctdsp_init(&s->idsp, avctx);
+    ff_init_scantable_permutation(s->idsp.idct_permutation, FF_IDCT_PERM_NONE);
+    ff_init_scantable(s->idsp.idct_permutation, &s->scantable, ff_zigzag_direct);
     ff_mpeg12_init_vlcs();
+
+    s->last_frame = av_frame_alloc();
+    if (!s->last_frame)
+        return AVERROR(ENOMEM);
+
     return 0;
 }
 
-static inline void comp(unsigned char *dst, int dst_stride,
-                        unsigned char *src, int src_stride, int add)
+static inline void comp(unsigned char *dst, ptrdiff_t dst_stride,
+                        unsigned char *src, ptrdiff_t src_stride, int add)
 {
     int j, i;
     for (j=0; j<8; j++)
@@ -79,44 +89,46 @@ static inline void comp(unsigned char *dst, int dst_stride,
             dst[j*dst_stride + i] = av_clip_uint8(src[j*src_stride + i] + add);
 }
 
-static inline void comp_block(MadContext *t, int mb_x, int mb_y,
+static inline void comp_block(MadContext *t, AVFrame *frame,
+                              int mb_x, int mb_y,
                               int j, int mv_x, int mv_y, int add)
 {
     if (j < 4) {
-        unsigned offset = (mb_y*16 + ((j&2)<<2) + mv_y)*t->last_frame.linesize[0] + mb_x*16 + ((j&1)<<3) + mv_x;
-        if (offset >= (t->avctx->height - 7) * t->last_frame.linesize[0] - 7)
+        unsigned offset = (mb_y*16 + ((j&2)<<2) + mv_y)*t->last_frame->linesize[0] + mb_x*16 + ((j&1)<<3) + mv_x;
+        if (offset >= (t->avctx->height - 7) * t->last_frame->linesize[0] - 7)
             return;
-        comp(t->frame.data[0] + (mb_y*16 + ((j&2)<<2))*t->frame.linesize[0] + mb_x*16 + ((j&1)<<3),
-             t->frame.linesize[0],
-             t->last_frame.data[0] + offset,
-             t->last_frame.linesize[0], add);
-    } else if (!(t->avctx->flags & CODEC_FLAG_GRAY)) {
+        comp(frame->data[0] + (mb_y*16 + ((j&2)<<2))*frame->linesize[0] + mb_x*16 + ((j&1)<<3),
+             frame->linesize[0],
+             t->last_frame->data[0] + offset,
+             t->last_frame->linesize[0], add);
+    } else if (!(t->avctx->flags & AV_CODEC_FLAG_GRAY)) {
         int index = j - 3;
-        unsigned offset = (mb_y * 8 + (mv_y/2))*t->last_frame.linesize[index] + mb_x * 8 + (mv_x/2);
-        if (offset >= (t->avctx->height/2 - 7) * t->last_frame.linesize[index] - 7)
+        unsigned offset = (mb_y * 8 + (mv_y/2))*t->last_frame->linesize[index] + mb_x * 8 + (mv_x/2);
+        if (offset >= (t->avctx->height/2 - 7) * t->last_frame->linesize[index] - 7)
             return;
-        comp(t->frame.data[index] + (mb_y*8)*t->frame.linesize[index] + mb_x * 8,
-             t->frame.linesize[index],
-             t->last_frame.data[index] + offset,
-             t->last_frame.linesize[index], add);
+        comp(frame->data[index] + (mb_y*8)*frame->linesize[index] + mb_x * 8,
+             frame->linesize[index],
+             t->last_frame->data[index] + offset,
+             t->last_frame->linesize[index], add);
     }
 }
 
-static inline void idct_put(MadContext *t, DCTELEM *block, int mb_x, int mb_y, int j)
+static inline void idct_put(MadContext *t, AVFrame *frame, int16_t *block,
+                            int mb_x, int mb_y, int j)
 {
     if (j < 4) {
         ff_ea_idct_put_c(
-            t->frame.data[0] + (mb_y*16 + ((j&2)<<2))*t->frame.linesize[0] + mb_x*16 + ((j&1)<<3),
-            t->frame.linesize[0], block);
-    } else if (!(t->avctx->flags & CODEC_FLAG_GRAY)) {
+            frame->data[0] + (mb_y*16 + ((j&2)<<2))*frame->linesize[0] + mb_x*16 + ((j&1)<<3),
+            frame->linesize[0], block);
+    } else if (!(t->avctx->flags & AV_CODEC_FLAG_GRAY)) {
         int index = j - 3;
         ff_ea_idct_put_c(
-            t->frame.data[index] + (mb_y*8)*t->frame.linesize[index] + mb_x*8,
-            t->frame.linesize[index], block);
+            frame->data[index] + (mb_y*8)*frame->linesize[index] + mb_x*8,
+            frame->linesize[index], block);
     }
 }
 
-static inline int decode_block_intra(MadContext *s, DCTELEM * block)
+static inline int decode_block_intra(MadContext *s, int16_t * block)
 {
     int level, i, j, run;
     RLTable *rl = &ff_rl_mpeg1;
@@ -139,6 +151,11 @@ static inline int decode_block_intra(MadContext *s, DCTELEM * block)
                 break;
             } else if (level != 0) {
                 i += run;
+                if (i > 63) {
+                    av_log(s->avctx, AV_LOG_ERROR,
+                           "ac-tex damaged at %d %d\n", s->mb_x, s->mb_y);
+                    return -1;
+                }
                 j = scantable[i];
                 level = (level*quant_matrix[j]) >> 4;
                 level = (level-1)|1;
@@ -153,6 +170,11 @@ static inline int decode_block_intra(MadContext *s, DCTELEM * block)
                 run = SHOW_UBITS(re, &s->gb, 6)+1; LAST_SKIP_BITS(re, &s->gb, 6);
 
                 i += run;
+                if (i > 63) {
+                    av_log(s->avctx, AV_LOG_ERROR,
+                           "ac-tex damaged at %d %d\n", s->mb_x, s->mb_y);
+                    return -1;
+                }
                 j = scantable[i];
                 if (level < 0) {
                     level = -level;
@@ -163,10 +185,6 @@ static inline int decode_block_intra(MadContext *s, DCTELEM * block)
                     level = (level*quant_matrix[j]) >> 4;
                     level = (level-1)|1;
                 }
-            }
-            if (i > 63) {
-                av_log(s->avctx, AV_LOG_ERROR, "ac-tex damaged at %d %d\n", s->mb_x, s->mb_y);
-                return -1;
             }
 
             block[j] = level;
@@ -187,10 +205,10 @@ static int decode_motion(GetBitContext *gb)
     return value;
 }
 
-static int decode_mb(MadContext *s, int inter)
+static int decode_mb(MadContext *s, AVFrame *frame, int inter)
 {
     int mv_map = 0;
-    int mv_x, mv_y;
+    int av_uninit(mv_x), av_uninit(mv_y);
     int j;
 
     if (inter) {
@@ -205,13 +223,13 @@ static int decode_mb(MadContext *s, int inter)
     for (j=0; j<6; j++) {
         if (mv_map & (1<<j)) {  // mv_x and mv_y are guarded by mv_map
             int add = 2*decode_motion(&s->gb);
-            if (s->last_frame.data[0])
-                comp_block(s, s->mb_x, s->mb_y, j, mv_x, mv_y, add);
+            if (s->last_frame->data[0])
+                comp_block(s, frame, s->mb_x, s->mb_y, j, mv_x, mv_y, add);
         } else {
-            s->dsp.clear_block(s->block);
+            s->bdsp.clear_block(s->block);
             if(decode_block_intra(s, s->block) < 0)
                 return -1;
-            idct_put(s, s->block, s->mb_x, s->mb_y, j);
+            idct_put(s, frame, s->block, s->mb_x, s->mb_y, j);
         }
     }
     return 0;
@@ -232,68 +250,83 @@ static int decode_frame(AVCodecContext *avctx,
 {
     const uint8_t *buf = avpkt->data;
     int buf_size       = avpkt->size;
-    const uint8_t *buf_end = buf+buf_size;
     MadContext *s     = avctx->priv_data;
-    int width, height, ret;
+    AVFrame *frame    = data;
+    GetByteContext gb;
+    int width, height;
     int chunk_type;
-    int inter;
+    int inter, ret;
 
-    if (buf_size < 26) {
-        av_log(avctx, AV_LOG_ERROR, "Input buffer too small\n");
-        *got_frame = 0;
+    bytestream2_init(&gb, buf, buf_size);
+
+    chunk_type = bytestream2_get_le32(&gb);
+    inter = (chunk_type == MADm_TAG || chunk_type == MADe_TAG);
+    bytestream2_skip(&gb, 10);
+
+    av_reduce(&avctx->framerate.den, &avctx->framerate.num,
+              bytestream2_get_le16(&gb), 1000, 1<<30);
+
+    width  = bytestream2_get_le16(&gb);
+    height = bytestream2_get_le16(&gb);
+    bytestream2_skip(&gb, 1);
+    calc_quant_matrix(s, bytestream2_get_byte(&gb));
+    bytestream2_skip(&gb, 2);
+
+    if (bytestream2_get_bytes_left(&gb) < 2) {
+        av_log(avctx, AV_LOG_ERROR, "Input data too small\n");
         return AVERROR_INVALIDDATA;
     }
 
-    chunk_type = AV_RL32(&buf[0]);
-    inter = (chunk_type == MADm_TAG || chunk_type == MADe_TAG);
-    buf += 8;
-
-    av_reduce(&avctx->time_base.num, &avctx->time_base.den,
-              AV_RL16(&buf[6]), 1000, 1<<30);
-
-    width  = AV_RL16(&buf[8]);
-    height = AV_RL16(&buf[10]);
-    calc_quant_matrix(s, buf[13]);
-    buf += 16;
-
-    if (avctx->width != width || avctx->height != height) {
-        if((width * height)/2048*7 > buf_end-buf)
-            return AVERROR_INVALIDDATA;
-        if ((ret = av_image_check_size(width, height, 0, avctx)) < 0)
-            return ret;
-        avcodec_set_dimensions(avctx, width, height);
-        if (s->frame.data[0])
-            avctx->release_buffer(avctx, &s->frame);
-        if (s->last_frame.data[0])
-            avctx->release_buffer(avctx, &s->last_frame);
+    if (width < 16 || height < 16) {
+        av_log(avctx, AV_LOG_ERROR, "Dimensions too small\n");
+        return AVERROR_INVALIDDATA;
     }
 
-    s->frame.reference = 3;
-    if (!s->frame.data[0]) {
-        if ((ret = ff_get_buffer(avctx, &s->frame)) < 0) {
-            av_log(avctx, AV_LOG_ERROR, "get_buffer() failed\n");
+    if (avctx->width != width || avctx->height != height) {
+        av_frame_unref(s->last_frame);
+        if((width * (int64_t)height)/2048*7 > bytestream2_get_bytes_left(&gb))
+            return AVERROR_INVALIDDATA;
+        if ((ret = ff_set_dimensions(avctx, width, height)) < 0)
             return ret;
-        }
+    }
+
+    if ((ret = ff_get_buffer(avctx, frame, AV_GET_BUFFER_FLAG_REF)) < 0)
+        return ret;
+
+    if (inter && !s->last_frame->data[0]) {
+        av_log(avctx, AV_LOG_WARNING, "Missing reference frame.\n");
+        ret = ff_get_buffer(avctx, s->last_frame, AV_GET_BUFFER_FLAG_REF);
+        if (ret < 0)
+            return ret;
+        memset(s->last_frame->data[0], 0, s->last_frame->height *
+               s->last_frame->linesize[0]);
+        memset(s->last_frame->data[1], 0x80, s->last_frame->height / 2 *
+               s->last_frame->linesize[1]);
+        memset(s->last_frame->data[2], 0x80, s->last_frame->height / 2 *
+               s->last_frame->linesize[2]);
     }
 
     av_fast_padded_malloc(&s->bitstream_buf, &s->bitstream_buf_size,
-                          buf_end - buf);
+                          bytestream2_get_bytes_left(&gb));
     if (!s->bitstream_buf)
         return AVERROR(ENOMEM);
-    s->dsp.bswap16_buf(s->bitstream_buf, (const uint16_t*)buf, (buf_end-buf)/2);
-    memset((uint8_t*)s->bitstream_buf + (buf_end-buf), 0, FF_INPUT_BUFFER_PADDING_SIZE);
-    init_get_bits(&s->gb, s->bitstream_buf, 8*(buf_end-buf));
+    s->bbdsp.bswap16_buf(s->bitstream_buf, (const uint16_t *)(buf + bytestream2_tell(&gb)),
+                         bytestream2_get_bytes_left(&gb) / 2);
+    memset((uint8_t*)s->bitstream_buf + bytestream2_get_bytes_left(&gb), 0, AV_INPUT_BUFFER_PADDING_SIZE);
+    init_get_bits(&s->gb, s->bitstream_buf, 8*(bytestream2_get_bytes_left(&gb)));
 
     for (s->mb_y=0; s->mb_y < (avctx->height+15)/16; s->mb_y++)
         for (s->mb_x=0; s->mb_x < (avctx->width +15)/16; s->mb_x++)
-            if(decode_mb(s, inter) < 0)
+            if(decode_mb(s, frame, inter) < 0)
                 return AVERROR_INVALIDDATA;
 
     *got_frame = 1;
-    *(AVFrame*)data = s->frame;
 
-    if (chunk_type != MADe_TAG)
-        FFSWAP(AVFrame, s->frame, s->last_frame);
+    if (chunk_type != MADe_TAG) {
+        av_frame_unref(s->last_frame);
+        if ((ret = av_frame_ref(s->last_frame, frame)) < 0)
+            return ret;
+    }
 
     return buf_size;
 }
@@ -301,22 +334,19 @@ static int decode_frame(AVCodecContext *avctx,
 static av_cold int decode_end(AVCodecContext *avctx)
 {
     MadContext *t = avctx->priv_data;
-    if (t->frame.data[0])
-        avctx->release_buffer(avctx, &t->frame);
-    if (t->last_frame.data[0])
-        avctx->release_buffer(avctx, &t->last_frame);
-    av_free(t->bitstream_buf);
+    av_frame_free(&t->last_frame);
+    av_freep(&t->bitstream_buf);
     return 0;
 }
 
 AVCodec ff_eamad_decoder = {
     .name           = "eamad",
+    .long_name      = NULL_IF_CONFIG_SMALL("Electronic Arts Madcow Video"),
     .type           = AVMEDIA_TYPE_VIDEO,
     .id             = AV_CODEC_ID_MAD,
     .priv_data_size = sizeof(MadContext),
     .init           = decode_init,
     .close          = decode_end,
     .decode         = decode_frame,
-    .capabilities   = CODEC_CAP_DR1,
-    .long_name      = NULL_IF_CONFIG_SMALL("Electronic Arts Madcow Video")
+    .capabilities   = AV_CODEC_CAP_DR1,
 };

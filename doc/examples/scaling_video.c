@@ -23,7 +23,7 @@
 /**
  * @file
  * libswscale API use example.
- * @example doc/examples/scaling_video.c
+ * @example scaling_video.c
  */
 
 #include <libavutil/imgutils.h>
@@ -107,7 +107,7 @@ int main(int argc, char **argv)
         goto end;
     }
 
-    /* buffer is going to be written to rawvideo file, no alignmnet */
+    /* buffer is going to be written to rawvideo file, no alignment */
     if ((ret = av_image_alloc(dst_data, dst_linesize,
                               dst_w, dst_h, dst_pix_fmt, 1)) < 0) {
         fprintf(stderr, "Could not allocate destination image\n");
@@ -132,8 +132,7 @@ int main(int argc, char **argv)
            av_get_pix_fmt_name(dst_pix_fmt), dst_w, dst_h, dst_filename);
 
 end:
-    if (dst_file)
-        fclose(dst_file);
+    fclose(dst_file);
     av_freep(&src_data[0]);
     av_freep(&dst_data[0]);
     sws_freeContext(sws_ctx);

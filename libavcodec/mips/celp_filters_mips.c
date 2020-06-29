@@ -55,8 +55,10 @@
 #include "libavutil/attributes.h"
 #include "libavutil/common.h"
 #include "libavcodec/celp_filters.h"
+#include "libavutil/mips/asmdefs.h"
 
 #if HAVE_INLINE_ASM
+#if !HAVE_MIPS32R6 && !HAVE_MIPS64R6
 static void ff_celp_lp_synthesis_filterf_mips(float *out,
                                   const float *filter_coeffs,
                                   const float* in, int buffer_length,
@@ -111,15 +113,15 @@ static void ff_celp_lp_synthesis_filterf_mips(float *out,
             : [old_out0]"f"(old_out0), [old_out1]"f"(old_out1),
               [old_out2]"f"(old_out2), [old_out3]"f"(old_out3),
               [filter_coeffs]"r"(filter_coeffs)
-            : "$f0", "$f1", "$f2", "$f3", "$f4"
+            : "$f0", "$f1", "$f2", "$f3", "$f4", "memory"
         );
 
         for (i = 5; i <= filter_length; i += 2) {
             __asm__ volatile(
                 "lwc1    %[old_out3], -20(%[p_out])                         \n\t"
                 "lwc1    $f5,         16(%[p_filter_coeffs])                \n\t"
-                "addiu   %[p_out],    -8                                    \n\t"
-                "addiu   %[p_filter_coeffs], 8                              \n\t"
+                PTR_ADDIU "%[p_out],  -8                                    \n\t"
+                PTR_ADDIU "%[p_filter_coeffs], 8                            \n\t"
                 "nmsub.s %[out1],     %[out1],      $f5, %[old_out0]        \n\t"
                 "nmsub.s %[out3],     %[out3],      $f5, %[old_out2]        \n\t"
                 "lwc1    $f4,         12(%[p_filter_coeffs])                \n\t"
@@ -138,7 +140,7 @@ static void ff_celp_lp_synthesis_filterf_mips(float *out,
                   [old_out3]"+f"(old_out3),[p_filter_coeffs]"+r"(p_filter_coeffs),
                   [p_out]"+r"(p_out)
                 :
-                : "$f4", "$f5"
+                : "$f4", "$f5", "memory"
             );
             FFSWAP(float, old_out0, old_out2);
         }
@@ -181,13 +183,15 @@ static void ff_celp_lp_synthesis_filterf_mips(float *out,
             __asm__ volatile(
                 "lwc1    %[fc_val],          0(%[p_filter_coeffs])                        \n\t"
                 "lwc1    %[out_val_i],       -4(%[p_out])                                 \n\t"
-                "addiu   %[p_filter_coeffs], 4                                            \n\t"
-                "addiu   %[p_out],           -4                                           \n\t"
+                PTR_ADDIU "%[p_filter_coeffs], 4                                          \n\t"
+                PTR_ADDIU "%[p_out],         -4                                           \n\t"
                 "nmsub.s %[out_val],         %[out_val],          %[fc_val], %[out_val_i] \n\t"
 
                 : [fc_val]"=&f"(fc_val), [out_val]"+f"(out_val),
                   [out_val_i]"=&f"(out_val_i), [p_out]"+r"(p_out),
                   [p_filter_coeffs]"+r"(p_filter_coeffs)
+                :
+                : "memory"
             );
         }
         out[n] = out_val;
@@ -243,8 +247,8 @@ static void ff_celp_lp_zero_synthesis_filterf_mips(float *out,
             "madd.s %[sum_out1], %[sum_out1],          %[fc_val], $f0       \n\t"
             "lwc1   %[fc_val],   4(%[p_filter_coeffs])                      \n\t"
             "lwc1   $f7,         -8(%[p_in])                                \n\t"
-            "addiu  %[p_filter_coeffs], 8                                   \n\t"
-            "addiu  %[p_in],     -8                                         \n\t"
+            PTR_ADDIU "%[p_filter_coeffs], 8                                \n\t"
+            PTR_ADDIU "%[p_in],  -8                                         \n\t"
             "madd.s %[sum_out8], %[sum_out8],          %[fc_val], $f6       \n\t"
             "madd.s %[sum_out7], %[sum_out7],          %[fc_val], $f5       \n\t"
             "madd.s %[sum_out6], %[sum_out6],          %[fc_val], $f4       \n\t"
@@ -262,7 +266,7 @@ static void ff_celp_lp_zero_synthesis_filterf_mips(float *out,
               [fc_val]"=&f"(fc_val), [p_filter_coeffs]"+r"(p_filter_coeffs),
               [p_in]"+r"(p_in), [i]"+r"(i)
             :
-            : "$f0", "$f1", "$f2", "$f3", "$f4", "$f5", "$f6", "$f7"
+            : "$f0", "$f1", "$f2", "$f3", "$f4", "$f5", "$f6", "$f7", "memory"
         );
 
         out[n+7] = sum_out8;
@@ -275,12 +279,15 @@ static void ff_celp_lp_zero_synthesis_filterf_mips(float *out,
         out[n] = sum_out1;
     }
 }
+#endif /* !HAVE_MIPS32R6 && !HAVE_MIPS64R6 */
 #endif /* HAVE_INLINE_ASM */
 
 void ff_celp_filter_init_mips(CELPFContext *c)
 {
 #if HAVE_INLINE_ASM
+#if !HAVE_MIPS32R6 && !HAVE_MIPS64R6
     c->celp_lp_synthesis_filterf        = ff_celp_lp_synthesis_filterf_mips;
     c->celp_lp_zero_synthesis_filterf   = ff_celp_lp_zero_synthesis_filterf_mips;
+#endif
 #endif
 }

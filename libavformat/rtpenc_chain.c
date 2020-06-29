@@ -22,7 +22,6 @@
 #include "avformat.h"
 #include "avio_internal.h"
 #include "rtpenc_chain.h"
-#include "avio_internal.h"
 #include "rtp.h"
 #include "libavutil/opt.h"
 
@@ -32,7 +31,7 @@ int ff_rtp_chain_mux_open(AVFormatContext **out, AVFormatContext *s,
 {
     AVFormatContext *rtpctx = NULL;
     int ret;
-    AVOutputFormat *rtp_format = av_guess_format("rtp", NULL, NULL);
+    ff_const59 AVOutputFormat *rtp_format = av_guess_format("rtp", NULL, NULL);
     uint8_t *rtpflags;
     AVDictionary *opts = NULL;
 
@@ -59,12 +58,13 @@ int ff_rtp_chain_mux_open(AVFormatContext **out, AVFormatContext *s,
     rtpctx->max_delay = s->max_delay;
     /* Copy other stream parameters. */
     rtpctx->streams[0]->sample_aspect_ratio = st->sample_aspect_ratio;
-    rtpctx->flags |= s->flags & AVFMT_FLAG_MP4A_LATM;
+    rtpctx->flags |= s->flags & AVFMT_FLAG_BITEXACT;
+    rtpctx->strict_std_compliance = s->strict_std_compliance;
 
     /* Get the payload type from the codec */
     if (st->id < RTP_PT_PRIVATE)
         rtpctx->streams[0]->id =
-            ff_rtp_get_payload_type(rtpctx, st->codec, idx);
+            ff_rtp_get_payload_type(s, st->codecpar, idx);
     else
         rtpctx->streams[0]->id = st->id;
 
@@ -75,22 +75,24 @@ int ff_rtp_chain_mux_open(AVFormatContext **out, AVFormatContext *s,
     /* Set the synchronized start time. */
     rtpctx->start_time_realtime = s->start_time_realtime;
 
-    avcodec_copy_context(rtpctx->streams[0]->codec, st->codec);
+    avcodec_parameters_copy(rtpctx->streams[0]->codecpar, st->codecpar);
+    rtpctx->streams[0]->time_base = st->time_base;
 
     if (handle) {
-        ffio_fdopen(&rtpctx->pb, handle);
+        ret = ffio_fdopen(&rtpctx->pb, handle);
+        if (ret < 0)
+            ffurl_close(handle);
     } else
-        ffio_open_dyn_packet_buf(&rtpctx->pb, packet_size);
-    ret = avformat_write_header(rtpctx, &opts);
+        ret = ffio_open_dyn_packet_buf(&rtpctx->pb, packet_size);
+    if (!ret)
+        ret = avformat_write_header(rtpctx, &opts);
     av_dict_free(&opts);
 
     if (ret) {
-        if (handle) {
-            avio_close(rtpctx->pb);
-        } else {
-            uint8_t *ptr;
-            avio_close_dyn_buf(rtpctx->pb, &ptr);
-            av_free(ptr);
+        if (handle && rtpctx->pb) {
+            avio_closep(&rtpctx->pb);
+        } else if (rtpctx->pb) {
+            ffio_free_dyn_buf(&rtpctx->pb);
         }
         avformat_free_context(rtpctx);
         return ret;
@@ -100,7 +102,7 @@ int ff_rtp_chain_mux_open(AVFormatContext **out, AVFormatContext *s,
     return 0;
 
 fail:
-    av_free(rtpctx);
+    avformat_free_context(rtpctx);
     if (handle)
         ffurl_close(handle);
     return ret;

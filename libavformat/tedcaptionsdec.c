@@ -34,7 +34,7 @@ typedef struct {
 
 static const AVOption tedcaptions_options[] = {
     { "start_time", "set the start time (offset) of the subtitles, in ms",
-      offsetof(TEDCaptionsDemuxer, start_time), FF_OPT_TYPE_INT64,
+      offsetof(TEDCaptionsDemuxer, start_time), AV_OPT_TYPE_INT64,
       { .i64 = 15000 }, INT64_MIN, INT64_MAX,
       AV_OPT_FLAG_SUBTITLE_PARAM | AV_OPT_FLAG_DECODING_PARAM },
     { NULL },
@@ -51,7 +51,7 @@ static const AVClass tedcaptions_demuxer_class = {
 
 #define HEX_DIGIT_TEST(c) (BETWEEN(c, '0', '9') || BETWEEN((c) | 32, 'a', 'z'))
 #define HEX_DIGIT_VAL(c) ((c) <= '9' ? (c) - '0' : ((c) | 32) - 'a' + 10)
-#define ERR_CODE(c) (c < 0 ? c : AVERROR_INVALIDDATA)
+#define ERR_CODE(c) ((c) < 0 ? (c) : AVERROR_INVALIDDATA)
 
 static void av_bprint_utf8(AVBPrint *bp, unsigned c)
 {
@@ -94,7 +94,7 @@ static int parse_string(AVIOContext *pb, int *cur_byte, AVBPrint *bp, int full)
 {
     int ret;
 
-    av_bprint_init(bp, 0, full ? -1 : 1);
+    av_bprint_init(bp, 0, full ? AV_BPRINT_SIZE_UNLIMITED : AV_BPRINT_SIZE_AUTOMATIC);
     ret = expect_byte(pb, cur_byte, '"');
     if (ret < 0)
         goto fail;
@@ -153,7 +153,8 @@ static int parse_label(AVIOContext *pb, int *cur_byte, AVBPrint *bp)
 
 static int parse_boolean(AVIOContext *pb, int *cur_byte, int *result)
 {
-    const char *text[] = { "false", "true" }, *p;
+    static const char * const text[] = { "false", "true" };
+    const char *p;
     int i;
 
     skip_spaces(pb, cur_byte);
@@ -274,9 +275,12 @@ static int parse_file(AVIOContext *pb, FFDemuxSubtitlesQueue *subs)
 static av_cold int tedcaptions_read_header(AVFormatContext *avf)
 {
     TEDCaptionsDemuxer *tc = avf->priv_data;
-    AVStream *st;
+    AVStream *st = avformat_new_stream(avf, NULL);
     int ret, i;
     AVPacket *last;
+
+    if (!st)
+        return AVERROR(ENOMEM);
 
     ret = parse_file(avf->pb, &tc->subs);
     if (ret < 0) {
@@ -286,16 +290,13 @@ static av_cold int tedcaptions_read_header(AVFormatContext *avf)
         ff_subtitles_queue_clean(&tc->subs);
         return ret;
     }
-    ff_subtitles_queue_finalize(&tc->subs);
+    ff_subtitles_queue_finalize(avf, &tc->subs);
     for (i = 0; i < tc->subs.nb_subs; i++)
         tc->subs.subs[i].pts += tc->start_time;
 
     last = &tc->subs.subs[tc->subs.nb_subs - 1];
-    st = avformat_new_stream(avf, NULL);
-    if (!st)
-        return AVERROR(ENOMEM);
-    st->codec->codec_type     = AVMEDIA_TYPE_SUBTITLE;
-    st->codec->codec_id       = CODEC_ID_TEXT;
+    st->codecpar->codec_type     = AVMEDIA_TYPE_SUBTITLE;
+    st->codecpar->codec_id       = AV_CODEC_ID_TEXT;
     avpriv_set_pts_info(st, 64, 1, 1000);
     st->probe_packets = 0;
     st->start_time    = 0;
@@ -320,7 +321,7 @@ static int tedcaptions_read_close(AVFormatContext *avf)
     return 0;
 }
 
-static av_cold int tedcaptions_read_probe(AVProbeData *p)
+static av_cold int tedcaptions_read_probe(const AVProbeData *p)
 {
     static const char *const tags[] = {
         "\"captions\"", "\"duration\"", "\"content\"",
@@ -340,7 +341,7 @@ static av_cold int tedcaptions_read_probe(AVProbeData *p)
             count++;
     }
     return count == FF_ARRAY_ELEMS(tags) ? AVPROBE_SCORE_MAX :
-           count                         ? AVPROBE_SCORE_MAX / 2 : 0;
+           count                         ? AVPROBE_SCORE_EXTENSION : 0;
 }
 
 static int tedcaptions_read_seek(AVFormatContext *avf, int stream_index,

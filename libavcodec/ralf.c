@@ -3,20 +3,20 @@
  *
  * Copyright (c) 2012 Konstantin Shishkov
  *
- * This file is part of Libav.
+ * This file is part of FFmpeg.
  *
- * Libav is free software; you can redistribute it and/or
+ * FFmpeg is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
  * version 2.1 of the License, or (at your option) any later version.
  *
- * Libav is distributed in the hope that it will be useful,
+ * FFmpeg is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
  * Lesser General Public License for more details.
  *
  * You should have received a copy of the GNU Lesser General Public
- * License along with Libav; if not, write to the Free Software
+ * License along with FFmpeg; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
@@ -26,6 +26,7 @@
  * Dedicated to the mastermind behind it, Ralph Wiggum.
  */
 
+#include "libavutil/attributes.h"
 #include "libavutil/channel_layout.h"
 #include "avcodec.h"
 #include "get_bits.h"
@@ -49,8 +50,6 @@ typedef struct VLCSet {
 #define RALF_MAX_PKT_SIZE 8192
 
 typedef struct RALFContext {
-    AVFrame frame;
-
     int version;
     int max_frame_size;
     VLCSet sets[3];
@@ -61,7 +60,7 @@ typedef struct RALFContext {
     int     filter_bits;     ///< filter precision for the current channel data
     int32_t filter[64];
 
-    int     bias[2];         ///< a constant value added to channel data after filtering
+    unsigned bias[2];        ///< a constant value added to channel data after filtering
 
     int num_blocks;          ///< number of blocks inside the frame
     int sample_offset;
@@ -74,7 +73,7 @@ typedef struct RALFContext {
 
 #define MAX_ELEMS 644 // no RALF table uses more than that
 
-static int init_ralf_vlc(VLC *vlc, const uint8_t *data, int elems)
+static av_cold int init_ralf_vlc(VLC *vlc, const uint8_t *data, int elems)
 {
     uint8_t  lens[MAX_ELEMS];
     uint16_t codes[MAX_ELEMS];
@@ -138,7 +137,7 @@ static av_cold int decode_init(AVCodecContext *avctx)
 
     ctx->version = AV_RB16(avctx->extradata + 4);
     if (ctx->version != 0x103) {
-        av_log_ask_for_sample(avctx, "unknown version %X\n", ctx->version);
+        avpriv_request_sample(avctx, "Unknown version %X", ctx->version);
         return AVERROR_PATCHWELCOME;
     }
 
@@ -153,9 +152,6 @@ static av_cold int decode_init(AVCodecContext *avctx)
     avctx->sample_fmt     = AV_SAMPLE_FMT_S16P;
     avctx->channel_layout = (avctx->channels == 2) ? AV_CH_LAYOUT_STEREO
                                                    : AV_CH_LAYOUT_MONO;
-
-    avcodec_get_frame_defaults(&ctx->frame);
-    avctx->coded_frame = &ctx->frame;
 
     ctx->max_frame_size = AV_RB32(avctx->extradata + 16);
     if (ctx->max_frame_size > (1 << 20) || !ctx->max_frame_size) {
@@ -224,7 +220,7 @@ static inline int extend_code(GetBitContext *gb, int val, int range, int bits)
         val -= range;
     }
     if (bits)
-        val = (val << bits) | get_bits(gb, bits);
+        val = ((unsigned)val << bits) | get_bits(gb, bits);
     return val;
 }
 
@@ -238,8 +234,10 @@ static int decode_channel(RALFContext *ctx, GetBitContext *gb, int ch,
     int *dst = ctx->channel_data[ch];
 
     ctx->filter_params = get_vlc2(gb, set->filter_params.table, 9, 2);
-    ctx->filter_bits   = (ctx->filter_params - 2) >> 6;
-    ctx->filter_length = ctx->filter_params - (ctx->filter_bits << 6) - 1;
+    if (ctx->filter_params > 1) {
+        ctx->filter_bits   = (ctx->filter_params - 2) >> 6;
+        ctx->filter_length = ctx->filter_params - (ctx->filter_bits << 6) - 1;
+    }
 
     if (ctx->filter_params == FILTER_RAW) {
         for (i = 0; i < length; i++)
@@ -266,8 +264,8 @@ static int decode_channel(RALFContext *ctx, GetBitContext *gb, int ch,
             t = get_vlc2(gb, vlc[cmode].table, vlc[cmode].bits, 2);
             t = extend_code(gb, t, 21, add_bits);
             if (!cmode)
-                coeff -= 12 << add_bits;
-            coeff = t - coeff;
+                coeff -= 12U << add_bits;
+            coeff = (unsigned)t - coeff;
             ctx->filter[i] = coeff;
 
             cmode = coeff >> add_bits;
@@ -290,7 +288,7 @@ static int decode_channel(RALFContext *ctx, GetBitContext *gb, int ch,
             add_bits--;
         range    = 10;
         range2   = 21;
-        code_vlc = set->long_codes + code_params - 15;
+        code_vlc = set->long_codes + (code_params - 15);
     } else {
         add_bits = 0;
         range    = 6;
@@ -304,8 +302,8 @@ static int decode_channel(RALFContext *ctx, GetBitContext *gb, int ch,
         t = get_vlc2(gb, code_vlc->table, code_vlc->bits, 2);
         code1 = t / range2;
         code2 = t % range2;
-        dst[i]     = extend_code(gb, code1, range, 0) << add_bits;
-        dst[i + 1] = extend_code(gb, code2, range, 0) << add_bits;
+        dst[i]     = extend_code(gb, code1, range, 0) * (1U << add_bits);
+        dst[i + 1] = extend_code(gb, code2, range, 0) * (1U << add_bits);
         if (add_bits) {
             dst[i]     |= get_bits(gb, add_bits);
             dst[i + 1] |= get_bits(gb, add_bits);
@@ -327,12 +325,12 @@ static void apply_lpc(RALFContext *ctx, int ch, int length, int bits)
 
         acc = 0;
         for (j = 0; j < flen; j++)
-            acc += ctx->filter[j] * audio[i - j - 1];
+            acc += (unsigned)ctx->filter[j] * audio[i - j - 1];
         if (acc < 0) {
             acc = (acc + bias - 1) >> ctx->filter_bits;
             acc = FFMAX(acc, min_clip);
         } else {
-            acc = (acc + bias) >> ctx->filter_bits;
+            acc = ((unsigned)acc + bias) >> ctx->filter_bits;
             acc = FFMIN(acc, max_clip);
         }
         audio[i] += acc;
@@ -346,7 +344,8 @@ static int decode_block(AVCodecContext *avctx, GetBitContext *gb,
     int len, ch, ret;
     int dmode, mode[2], bits[2];
     int *ch0, *ch1;
-    int i, t, t2;
+    int i;
+    unsigned int t, t2;
 
     len = 12 - get_unary(gb, 0, 6);
 
@@ -410,9 +409,9 @@ static int decode_block(AVCodecContext *avctx, GetBitContext *gb,
     case 4:
         for (i = 0; i < len; i++) {
             t  =   ch1[i] + ctx->bias[1];
-            t2 = ((ch0[i] + ctx->bias[0]) << 1) | (t & 1);
-            dst0[i] = (t2 + t) / 2;
-            dst1[i] = (t2 - t) / 2;
+            t2 = ((ch0[i] + ctx->bias[0]) * 2) | (t & 1);
+            dst0[i] = (int)(t2 + t) / 2;
+            dst1[i] = (int)(t2 - t) / 2;
         }
         break;
     }
@@ -426,6 +425,7 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame_ptr,
                         AVPacket *avpkt)
 {
     RALFContext *ctx = avctx->priv_data;
+    AVFrame *frame   = data;
     int16_t *samples0;
     int16_t *samples1;
     int ret;
@@ -463,13 +463,11 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame_ptr,
         src_size = avpkt->size;
     }
 
-    ctx->frame.nb_samples = ctx->max_frame_size;
-    if ((ret = ff_get_buffer(avctx, &ctx->frame)) < 0) {
-        av_log(avctx, AV_LOG_ERROR, "Me fail get_buffer()? That's unpossible!\n");
+    frame->nb_samples = ctx->max_frame_size;
+    if ((ret = ff_get_buffer(avctx, frame, 0)) < 0)
         return ret;
-    }
-    samples0 = (int16_t *)ctx->frame.data[0];
-    samples1 = (int16_t *)ctx->frame.data[1];
+    samples0 = (int16_t *)frame->data[0];
+    samples1 = (int16_t *)frame->data[1];
 
     if (src_size < 5) {
         av_log(avctx, AV_LOG_ERROR, "too short packets are too short!\n");
@@ -484,7 +482,9 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame_ptr,
     init_get_bits(&gb, src + 2, table_size);
     ctx->num_blocks = 0;
     while (get_bits_left(&gb) > 0) {
-        ctx->block_size[ctx->num_blocks] = get_bits(&gb, 15);
+        if (ctx->num_blocks >= FF_ARRAY_ELEMS(ctx->block_size))
+            return AVERROR_INVALIDDATA;
+        ctx->block_size[ctx->num_blocks] = get_bits(&gb, 13 + avctx->channels);
         if (get_bits1(&gb)) {
             ctx->block_pts[ctx->num_blocks] = get_bits(&gb, 9);
         } else {
@@ -511,9 +511,8 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame_ptr,
         bytes_left    -= ctx->block_size[i];
     }
 
-    ctx->frame.nb_samples = ctx->sample_offset;
-    *got_frame_ptr  = ctx->sample_offset > 0;
-    *(AVFrame*)data = ctx->frame;
+    frame->nb_samples = ctx->sample_offset;
+    *got_frame_ptr    = ctx->sample_offset > 0;
 
     return avpkt->size;
 }
@@ -528,6 +527,7 @@ static void decode_flush(AVCodecContext *avctx)
 
 AVCodec ff_ralf_decoder = {
     .name           = "ralf",
+    .long_name      = NULL_IF_CONFIG_SMALL("RealAudio Lossless"),
     .type           = AVMEDIA_TYPE_AUDIO,
     .id             = AV_CODEC_ID_RALF,
     .priv_data_size = sizeof(RALFContext),
@@ -535,8 +535,7 @@ AVCodec ff_ralf_decoder = {
     .close          = decode_close,
     .decode         = decode_frame,
     .flush          = decode_flush,
-    .capabilities   = CODEC_CAP_DR1,
-    .long_name      = NULL_IF_CONFIG_SMALL("RealAudio Lossless"),
+    .capabilities   = AV_CODEC_CAP_DR1,
     .sample_fmts    = (const enum AVSampleFormat[]) { AV_SAMPLE_FMT_S16P,
                                                       AV_SAMPLE_FMT_NONE },
 };

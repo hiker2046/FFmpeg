@@ -3,19 +3,19 @@
  *
  * This file is part of FFmpeg.
  *
- * FFmpeg is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * FFmpeg is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * FFmpeg is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with FFmpeg; if not, write to the Free Software Foundation, Inc.,
- * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with FFmpeg; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
 /**
@@ -23,7 +23,6 @@
  * EBU R.128 implementation
  * @see http://tech.ebu.ch/loudness
  * @see https://www.youtube.com/watch?v=iuEtQqC-Sqo "EBU R128 Introduction - Florian Camerer"
- * @todo True Peak
  * @todo implement start/stop/reset through filter command injection
  * @todo support other frequencies to avoid resampling
  */
@@ -33,9 +32,12 @@
 #include "libavutil/avassert.h"
 #include "libavutil/avstring.h"
 #include "libavutil/channel_layout.h"
+#include "libavutil/dict.h"
+#include "libavutil/ffmath.h"
 #include "libavutil/xga_font_data.h"
 #include "libavutil/opt.h"
 #include "libavutil/timestamp.h"
+#include "libswresample/swresample.h"
 #include "audio.h"
 #include "avfilter.h"
 #include "formats.h"
@@ -63,7 +65,7 @@
 #define HIST_SIZE  ((ABS_UP_THRES - ABS_THRES) * HIST_GRAIN + 1)
 
 /**
- * An histogram is an array of HIST_SIZE hist_entry storing all the energies
+ * A histogram is an array of HIST_SIZE hist_entry storing all the energies
  * recorded (with an accuracy of 1/HIST_GRAIN) of the loudnesses from ABS_THRES
  * (at 0) to ABS_UP_THRES (at HIST_SIZE-1).
  * This fixed-size system avoids the need of a list of energies growing
@@ -88,8 +90,19 @@ struct integrator {
 
 struct rect { int x, y, w, h; };
 
-typedef struct {
+typedef struct EBUR128Context {
     const AVClass *class;           ///< AVClass context for log and options purpose
+
+    /* peak metering */
+    int peak_mode;                  ///< enabled peak modes
+    double *true_peaks;             ///< true peaks per channel
+    double *sample_peaks;           ///< sample peaks per channel
+    double *true_peaks_per_frame;   ///< true peaks in a frame per channel
+#if CONFIG_SWRESAMPLE
+    SwrContext *swr_ctx;            ///< over-sampling context for true peak metering
+    double *swr_buf;                ///< resampled audio data for true peak metering
+    int swr_linesize;
+#endif
 
     /* video  */
     int do_video;                   ///< 1 if video output enabled, 0 otherwise
@@ -97,10 +110,12 @@ typedef struct {
     struct rect text;               ///< rectangle for the LU legend on the left
     struct rect graph;              ///< rectangle for the main graph in the center
     struct rect gauge;              ///< rectangle for the gauge on the right
-    AVFilterBufferRef *outpicref;   ///< output picture reference, updated regularly
+    AVFrame *outpicref;             ///< output picture reference, updated regularly
     int meter;                      ///< select a EBU mode between +9 and +18
     int scale_range;                ///< the range of LU values according to the meter
     int y_zero_lu;                  ///< the y value (pixel position) for 0 LU
+    int y_opt_max;                  ///< the y value (pixel position) for 1 LU
+    int y_opt_min;                  ///< the y value (pixel position) for -1 LU
     int *y_line_ref;                ///< y reference values for drawing the LU lines in the graph and the gauge
 
     /* audio */
@@ -123,38 +138,93 @@ typedef struct {
     double integrated_loudness;     ///< integrated loudness in LUFS (I)
     double loudness_range;          ///< loudness range in LU (LRA)
     double lra_low, lra_high;       ///< low and high LRA values
+
+    /* misc */
+    int loglevel;                   ///< log level for frame logging
+    int metadata;                   ///< whether or not to inject loudness results in frames
+    int dual_mono;                  ///< whether or not to treat single channel input files as dual-mono
+    double pan_law;                 ///< pan law value used to calculate dual-mono measurements
+    int target;                     ///< target level in LUFS used to set relative zero LU in visualization
+    int gauge_type;                 ///< whether gauge shows momentary or short
+    int scale;                      ///< display scale type of statistics
 } EBUR128Context;
+
+enum {
+    PEAK_MODE_NONE          = 0,
+    PEAK_MODE_SAMPLES_PEAKS = 1<<1,
+    PEAK_MODE_TRUE_PEAKS    = 1<<2,
+};
+
+enum {
+    GAUGE_TYPE_MOMENTARY = 0,
+    GAUGE_TYPE_SHORTTERM = 1,
+};
+
+enum {
+    SCALE_TYPE_ABSOLUTE = 0,
+    SCALE_TYPE_RELATIVE = 1,
+};
 
 #define OFFSET(x) offsetof(EBUR128Context, x)
 #define A AV_OPT_FLAG_AUDIO_PARAM
 #define V AV_OPT_FLAG_VIDEO_PARAM
 #define F AV_OPT_FLAG_FILTERING_PARAM
 static const AVOption ebur128_options[] = {
-    { "video", "set video output", OFFSET(do_video), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 1, V|F },
+    { "video", "set video output", OFFSET(do_video), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, V|F },
     { "size",  "set video size",   OFFSET(w), AV_OPT_TYPE_IMAGE_SIZE, {.str = "640x480"}, 0, 0, V|F },
     { "meter", "set scale meter (+9 to +18)",  OFFSET(meter), AV_OPT_TYPE_INT, {.i64 = 9}, 9, 18, V|F },
+    { "framelog", "force frame logging level", OFFSET(loglevel), AV_OPT_TYPE_INT, {.i64 = -1},   INT_MIN, INT_MAX, A|V|F, "level" },
+        { "info",    "information logging level", 0, AV_OPT_TYPE_CONST, {.i64 = AV_LOG_INFO},    INT_MIN, INT_MAX, A|V|F, "level" },
+        { "verbose", "verbose logging level",     0, AV_OPT_TYPE_CONST, {.i64 = AV_LOG_VERBOSE}, INT_MIN, INT_MAX, A|V|F, "level" },
+    { "metadata", "inject metadata in the filtergraph", OFFSET(metadata), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, A|V|F },
+    { "peak", "set peak mode", OFFSET(peak_mode), AV_OPT_TYPE_FLAGS, {.i64 = PEAK_MODE_NONE}, 0, INT_MAX, A|F, "mode" },
+        { "none",   "disable any peak mode",   0, AV_OPT_TYPE_CONST, {.i64 = PEAK_MODE_NONE},          INT_MIN, INT_MAX, A|F, "mode" },
+        { "sample", "enable peak-sample mode", 0, AV_OPT_TYPE_CONST, {.i64 = PEAK_MODE_SAMPLES_PEAKS}, INT_MIN, INT_MAX, A|F, "mode" },
+        { "true",   "enable true-peak mode",   0, AV_OPT_TYPE_CONST, {.i64 = PEAK_MODE_TRUE_PEAKS},    INT_MIN, INT_MAX, A|F, "mode" },
+    { "dualmono", "treat mono input files as dual-mono", OFFSET(dual_mono), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, A|F },
+    { "panlaw", "set a specific pan law for dual-mono files", OFFSET(pan_law), AV_OPT_TYPE_DOUBLE, {.dbl = -3.01029995663978}, -10.0, 0.0, A|F },
+    { "target", "set a specific target level in LUFS (-23 to 0)", OFFSET(target), AV_OPT_TYPE_INT, {.i64 = -23}, -23, 0, V|F },
+    { "gauge", "set gauge display type", OFFSET(gauge_type), AV_OPT_TYPE_INT, {.i64 = 0 }, GAUGE_TYPE_MOMENTARY, GAUGE_TYPE_SHORTTERM, V|F, "gaugetype" },
+        { "momentary",   "display momentary value",   0, AV_OPT_TYPE_CONST, {.i64 = GAUGE_TYPE_MOMENTARY}, INT_MIN, INT_MAX, V|F, "gaugetype" },
+        { "m",           "display momentary value",   0, AV_OPT_TYPE_CONST, {.i64 = GAUGE_TYPE_MOMENTARY}, INT_MIN, INT_MAX, V|F, "gaugetype" },
+        { "shortterm",   "display short-term value",  0, AV_OPT_TYPE_CONST, {.i64 = GAUGE_TYPE_SHORTTERM}, INT_MIN, INT_MAX, V|F, "gaugetype" },
+        { "s",           "display short-term value",  0, AV_OPT_TYPE_CONST, {.i64 = GAUGE_TYPE_SHORTTERM}, INT_MIN, INT_MAX, V|F, "gaugetype" },
+    { "scale", "sets display method for the stats", OFFSET(scale), AV_OPT_TYPE_INT, {.i64 = 0}, SCALE_TYPE_ABSOLUTE, SCALE_TYPE_RELATIVE, V|F, "scaletype" },
+        { "absolute",   "display absolute values (LUFS)",          0, AV_OPT_TYPE_CONST, {.i64 = SCALE_TYPE_ABSOLUTE}, INT_MIN, INT_MAX, V|F, "scaletype" },
+        { "LUFS",       "display absolute values (LUFS)",          0, AV_OPT_TYPE_CONST, {.i64 = SCALE_TYPE_ABSOLUTE}, INT_MIN, INT_MAX, V|F, "scaletype" },
+        { "relative",   "display values relative to target (LU)",  0, AV_OPT_TYPE_CONST, {.i64 = SCALE_TYPE_RELATIVE}, INT_MIN, INT_MAX, V|F, "scaletype" },
+        { "LU",         "display values relative to target (LU)",  0, AV_OPT_TYPE_CONST, {.i64 = SCALE_TYPE_RELATIVE}, INT_MIN, INT_MAX, V|F, "scaletype" },
     { NULL },
 };
 
 AVFILTER_DEFINE_CLASS(ebur128);
 
 static const uint8_t graph_colors[] = {
-    0xdd, 0x66, 0x66,   // value above 0LU non reached
-    0x66, 0x66, 0xdd,   // value below 0LU non reached
-    0x96, 0x33, 0x33,   // value above 0LU reached
-    0x33, 0x33, 0x96,   // value below 0LU reached
-    0xdd, 0x96, 0x96,   // value above 0LU line non reached
-    0x96, 0x96, 0xdd,   // value below 0LU line non reached
-    0xdd, 0x33, 0x33,   // value above 0LU line reached
-    0x33, 0x33, 0xdd,   // value below 0LU line reached
+    0xdd, 0x66, 0x66,   // value above 1LU non reached below -1LU (impossible)
+    0x66, 0x66, 0xdd,   // value below 1LU non reached below -1LU
+    0x96, 0x33, 0x33,   // value above 1LU reached below -1LU (impossible)
+    0x33, 0x33, 0x96,   // value below 1LU reached below -1LU
+    0xdd, 0x96, 0x96,   // value above 1LU line non reached below -1LU (impossible)
+    0x96, 0x96, 0xdd,   // value below 1LU line non reached below -1LU
+    0xdd, 0x33, 0x33,   // value above 1LU line reached below -1LU (impossible)
+    0x33, 0x33, 0xdd,   // value below 1LU line reached below -1LU
+    0xdd, 0x66, 0x66,   // value above 1LU non reached above -1LU
+    0x66, 0xdd, 0x66,   // value below 1LU non reached above -1LU
+    0x96, 0x33, 0x33,   // value above 1LU reached above -1LU
+    0x33, 0x96, 0x33,   // value below 1LU reached above -1LU
+    0xdd, 0x96, 0x96,   // value above 1LU line non reached above -1LU
+    0x96, 0xdd, 0x96,   // value below 1LU line non reached above -1LU
+    0xdd, 0x33, 0x33,   // value above 1LU line reached above -1LU
+    0x33, 0xdd, 0x33,   // value below 1LU line reached above -1LU
 };
 
 static const uint8_t *get_graph_color(const EBUR128Context *ebur128, int v, int y)
 {
-    const int below0  = y > ebur128->y_zero_lu;
+    const int above_opt_max = y > ebur128->y_opt_max;
+    const int below_opt_min = y < ebur128->y_opt_min;
     const int reached = y >= v;
     const int line    = ebur128->y_line_ref[y] || y == ebur128->y_zero_lu;
-    const int colorid = 4*line + 2*reached + below0;
+    const int colorid = 8*below_opt_min+ 4*line + 2*reached + above_opt_max;
     return graph_colors + 3*colorid;
 }
 
@@ -174,7 +244,7 @@ static const uint8_t font_colors[] = {
     0x00, 0x96, 0x96,
 };
 
-static void drawtext(AVFilterBufferRef *pic, int x, int y, int ftid, const uint8_t *color, const char *fmt, ...)
+static void drawtext(AVFrame *pic, int x, int y, int ftid, const uint8_t *color, const char *fmt, ...)
 {
     int i;
     char buf[128] = {0};
@@ -207,7 +277,7 @@ static void drawtext(AVFilterBufferRef *pic, int x, int y, int ftid, const uint8
     }
 }
 
-static void drawline(AVFilterBufferRef *pic, int x, int y, int len, int step)
+static void drawline(AVFrame *pic, int x, int y, int len, int step)
 {
     int i;
     uint8_t *p = pic->data[0] + y*pic->linesize[0] + x*3;
@@ -224,7 +294,7 @@ static int config_video_output(AVFilterLink *outlink)
     uint8_t *p;
     AVFilterContext *ctx = outlink->src;
     EBUR128Context *ebur128 = ctx->priv;
-    AVFilterBufferRef *outpicref;
+    AVFrame *outpicref;
 
     /* check if there is enough space to represent everything decently */
     if (ebur128->w < 640 || ebur128->h < 480) {
@@ -234,6 +304,7 @@ static int config_video_output(AVFilterLink *outlink)
     }
     outlink->w = ebur128->w;
     outlink->h = ebur128->h;
+    outlink->sample_aspect_ratio = (AVRational){1,1};
 
 #define PAD 8
 
@@ -259,13 +330,12 @@ static int config_video_output(AVFilterLink *outlink)
     av_assert0(ebur128->graph.h == ebur128->gauge.h);
 
     /* prepare the initial picref buffer */
-    avfilter_unref_bufferp(&ebur128->outpicref);
+    av_frame_free(&ebur128->outpicref);
     ebur128->outpicref = outpicref =
-        ff_get_video_buffer(outlink, AV_PERM_WRITE|AV_PERM_PRESERVE|AV_PERM_REUSE2,
-                            outlink->w, outlink->h);
+        ff_get_video_buffer(outlink, outlink->w, outlink->h);
     if (!outpicref)
         return AVERROR(ENOMEM);
-    outlink->sample_aspect_ratio = (AVRational){1,1};
+    outpicref->sample_aspect_ratio = (AVRational){1,1};
 
     /* init y references values (to draw LU lines) */
     ebur128->y_line_ref = av_calloc(ebur128->graph.h + 1, sizeof(*ebur128->y_line_ref));
@@ -288,6 +358,8 @@ static int config_video_output(AVFilterLink *outlink)
 
     /* draw graph */
     ebur128->y_zero_lu = lu_to_y(ebur128, 0);
+    ebur128->y_opt_max = lu_to_y(ebur128, 1);
+    ebur128->y_opt_min = lu_to_y(ebur128, -1);
     p = outpicref->data[0] + ebur128->graph.y * outpicref->linesize[0]
                            + ebur128->graph.x * 3;
     for (y = 0; y < ebur128->graph.h; y++) {
@@ -311,6 +383,24 @@ static int config_video_output(AVFilterLink *outlink)
     return 0;
 }
 
+static int config_audio_input(AVFilterLink *inlink)
+{
+    AVFilterContext *ctx = inlink->dst;
+    EBUR128Context *ebur128 = ctx->priv;
+
+    /* Force 100ms framing in case of metadata injection: the frames must have
+     * a granularity of the window overlap to be accurately exploited.
+     * As for the true peaks mode, it just simplifies the resampling buffer
+     * allocation and the lookup in it (since sample buffers differ in size, it
+     * can be more complex to integrate in the one-sample loop of
+     * filter_frame()). */
+    if (ebur128->metadata || (ebur128->peak_mode & PEAK_MODE_TRUE_PEAKS))
+        inlink->min_samples =
+        inlink->max_samples =
+        inlink->partial_buf_size = inlink->sample_rate / 10;
+    return 0;
+}
+
 static int config_audio_output(AVFilterLink *outlink)
 {
     int i;
@@ -319,7 +409,9 @@ static int config_audio_output(AVFilterLink *outlink)
     const int nb_channels = av_get_channel_layout_nb_channels(outlink->channel_layout);
 
 #define BACK_MASK (AV_CH_BACK_LEFT    |AV_CH_BACK_CENTER    |AV_CH_BACK_RIGHT| \
-                   AV_CH_TOP_BACK_LEFT|AV_CH_TOP_BACK_CENTER|AV_CH_TOP_BACK_RIGHT)
+                   AV_CH_TOP_BACK_LEFT|AV_CH_TOP_BACK_CENTER|AV_CH_TOP_BACK_RIGHT| \
+                   AV_CH_SIDE_LEFT                          |AV_CH_SIDE_RIGHT| \
+                   AV_CH_SURROUND_DIRECT_LEFT               |AV_CH_SURROUND_DIRECT_RIGHT)
 
     ebur128->nb_channels  = nb_channels;
     ebur128->ch_weighting = av_calloc(nb_channels, sizeof(*ebur128->ch_weighting));
@@ -327,14 +419,18 @@ static int config_audio_output(AVFilterLink *outlink)
         return AVERROR(ENOMEM);
 
     for (i = 0; i < nb_channels; i++) {
-
         /* channel weighting */
-        if ((outlink->channel_layout & 1ULL<<i) == AV_CH_LOW_FREQUENCY)
-            continue;
-        if (outlink->channel_layout & 1ULL<<i & BACK_MASK)
+        const uint64_t chl = av_channel_layout_extract_channel(outlink->channel_layout, i);
+        if (chl & (AV_CH_LOW_FREQUENCY|AV_CH_LOW_FREQUENCY_2)) {
+            ebur128->ch_weighting[i] = 0;
+        } else if (chl & BACK_MASK) {
             ebur128->ch_weighting[i] = 1.41;
-        else
+        } else {
             ebur128->ch_weighting[i] = 1.0;
+        }
+
+        if (!ebur128->ch_weighting[i])
+            continue;
 
         /* bins buffer for the two integration window (400ms and 3s) */
         ebur128->i400.cache[i]  = av_calloc(I400_BINS,  sizeof(*ebur128->i400.cache[0]));
@@ -343,17 +439,52 @@ static int config_audio_output(AVFilterLink *outlink)
             return AVERROR(ENOMEM);
     }
 
+#if CONFIG_SWRESAMPLE
+    if (ebur128->peak_mode & PEAK_MODE_TRUE_PEAKS) {
+        int ret;
+
+        ebur128->swr_buf    = av_malloc_array(nb_channels, 19200 * sizeof(double));
+        ebur128->true_peaks = av_calloc(nb_channels, sizeof(*ebur128->true_peaks));
+        ebur128->true_peaks_per_frame = av_calloc(nb_channels, sizeof(*ebur128->true_peaks_per_frame));
+        ebur128->swr_ctx    = swr_alloc();
+        if (!ebur128->swr_buf || !ebur128->true_peaks ||
+            !ebur128->true_peaks_per_frame || !ebur128->swr_ctx)
+            return AVERROR(ENOMEM);
+
+        av_opt_set_int(ebur128->swr_ctx, "in_channel_layout",    outlink->channel_layout, 0);
+        av_opt_set_int(ebur128->swr_ctx, "in_sample_rate",       outlink->sample_rate, 0);
+        av_opt_set_sample_fmt(ebur128->swr_ctx, "in_sample_fmt", outlink->format, 0);
+
+        av_opt_set_int(ebur128->swr_ctx, "out_channel_layout",    outlink->channel_layout, 0);
+        av_opt_set_int(ebur128->swr_ctx, "out_sample_rate",       192000, 0);
+        av_opt_set_sample_fmt(ebur128->swr_ctx, "out_sample_fmt", outlink->format, 0);
+
+        ret = swr_init(ebur128->swr_ctx);
+        if (ret < 0)
+            return ret;
+    }
+#endif
+
+    if (ebur128->peak_mode & PEAK_MODE_SAMPLES_PEAKS) {
+        ebur128->sample_peaks = av_calloc(nb_channels, sizeof(*ebur128->sample_peaks));
+        if (!ebur128->sample_peaks)
+            return AVERROR(ENOMEM);
+    }
+
     return 0;
 }
 
-#define ENERGY(loudness) (pow(10, ((loudness) + 0.691) / 10.))
+#define ENERGY(loudness) (ff_exp10(((loudness) + 0.691) / 10.))
 #define LOUDNESS(energy) (-0.691 + 10 * log10(energy))
+#define DBFS(energy) (20 * log10(energy))
 
 static struct hist_entry *get_histogram(void)
 {
     int i;
     struct hist_entry *h = av_calloc(HIST_SIZE, sizeof(*h));
 
+    if (!h)
+        return NULL;
     for (i = 0; i < HIST_SIZE; i++) {
         h[i].loudness = i / (double)HIST_GRAIN + ABS_THRES;
         h[i].energy   = ENERGY(h[i].loudness);
@@ -361,17 +492,25 @@ static struct hist_entry *get_histogram(void)
     return h;
 }
 
-static av_cold int init(AVFilterContext *ctx, const char *args)
+static av_cold int init(AVFilterContext *ctx)
 {
-    int ret;
     EBUR128Context *ebur128 = ctx->priv;
     AVFilterPad pad;
+    int ret;
 
-    ebur128->class = &ebur128_class;
-    av_opt_set_defaults(ebur128);
+    if (ebur128->loglevel != AV_LOG_INFO &&
+        ebur128->loglevel != AV_LOG_VERBOSE) {
+        if (ebur128->do_video || ebur128->metadata)
+            ebur128->loglevel = AV_LOG_VERBOSE;
+        else
+            ebur128->loglevel = AV_LOG_INFO;
+    }
 
-    if ((ret = av_set_options_string(ebur128, args, "=", ":")) < 0)
-        return ret;
+    if (!CONFIG_SWRESAMPLE && (ebur128->peak_mode & PEAK_MODE_TRUE_PEAKS)) {
+        av_log(ctx, AV_LOG_ERROR,
+               "True-peak mode requires libswresample to be performed\n");
+        return AVERROR(EINVAL);
+    }
 
     // if meter is  +9 scale, scale range is from -18 LU to  +9 LU (or 3*9)
     // if meter is +18 scale, scale range is from -36 LU to +18 LU (or 3*18)
@@ -379,6 +518,8 @@ static av_cold int init(AVFilterContext *ctx, const char *args)
 
     ebur128->i400.histogram  = get_histogram();
     ebur128->i3000.histogram = get_histogram();
+    if (!ebur128->i400.histogram || !ebur128->i3000.histogram)
+        return AVERROR(ENOMEM);
 
     ebur128->integrated_loudness = ABS_THRES;
     ebur128->loudness_range = 0;
@@ -392,7 +533,11 @@ static av_cold int init(AVFilterContext *ctx, const char *args)
         };
         if (!pad.name)
             return AVERROR(ENOMEM);
-        ff_insert_outpad(ctx, 0, &pad);
+        ret = ff_insert_outpad(ctx, 0, &pad);
+        if (ret < 0) {
+            av_freep(&pad.name);
+            return ret;
+        }
     }
     pad = (AVFilterPad){
         .name         = av_asprintf("out%d", ebur128->do_video),
@@ -401,7 +546,11 @@ static av_cold int init(AVFilterContext *ctx, const char *args)
     };
     if (!pad.name)
         return AVERROR(ENOMEM);
-    ff_insert_outpad(ctx, ebur128->do_video, &pad);
+    ret = ff_insert_outpad(ctx, ebur128->do_video, &pad);
+    if (ret < 0) {
+        av_freep(&pad.name);
+        return ret;
+    }
 
     /* summary */
     av_log(ctx, AV_LOG_VERBOSE, "EBU +%d scale\n", ebur128->meter);
@@ -436,17 +585,37 @@ static int gate_update(struct integrator *integ, double power,
     return gate_hist_pos;
 }
 
-static int filter_frame(AVFilterLink *inlink, AVFilterBufferRef *insamples)
+static int filter_frame(AVFilterLink *inlink, AVFrame *insamples)
 {
-    int i, ch;
+    int i, ch, idx_insample;
     AVFilterContext *ctx = inlink->dst;
     EBUR128Context *ebur128 = ctx->priv;
     const int nb_channels = ebur128->nb_channels;
-    const int nb_samples  = insamples->audio->nb_samples;
+    const int nb_samples  = insamples->nb_samples;
     const double *samples = (double *)insamples->data[0];
-    AVFilterBufferRef *pic = ebur128->outpicref;
+    AVFrame *pic = ebur128->outpicref;
 
-    for (i = 0; i < nb_samples; i++) {
+#if CONFIG_SWRESAMPLE
+    if (ebur128->peak_mode & PEAK_MODE_TRUE_PEAKS) {
+        const double *swr_samples = ebur128->swr_buf;
+        int ret = swr_convert(ebur128->swr_ctx, (uint8_t**)&ebur128->swr_buf, 19200,
+                              (const uint8_t **)insamples->data, nb_samples);
+        if (ret < 0)
+            return ret;
+        for (ch = 0; ch < nb_channels; ch++)
+            ebur128->true_peaks_per_frame[ch] = 0.0;
+        for (idx_insample = 0; idx_insample < ret; idx_insample++) {
+            for (ch = 0; ch < nb_channels; ch++) {
+                ebur128->true_peaks[ch] = FFMAX(ebur128->true_peaks[ch], fabs(*swr_samples));
+                ebur128->true_peaks_per_frame[ch] = FFMAX(ebur128->true_peaks_per_frame[ch],
+                                                          fabs(*swr_samples));
+                swr_samples++;
+            }
+        }
+    }
+#endif
+
+    for (idx_insample = 0; idx_insample < nb_samples; idx_insample++) {
         const int bin_id_400  = ebur128->i400.cache_pos;
         const int bin_id_3000 = ebur128->i3000.cache_pos;
 
@@ -464,6 +633,11 @@ static int filter_frame(AVFilterLink *inlink, AVFilterBufferRef *insamples)
         for (ch = 0; ch < nb_channels; ch++) {
             double bin;
 
+            if (ebur128->peak_mode & PEAK_MODE_SAMPLES_PEAKS)
+                ebur128->sample_peaks[ch] = FFMAX(ebur128->sample_peaks[ch], fabs(*samples));
+
+            ebur128->x[ch * 3] = *samples++; // set X[i]
+
             if (!ebur128->ch_weighting[ch])
                 continue;
 
@@ -476,8 +650,6 @@ static int filter_frame(AVFilterLink *inlink, AVFilterBufferRef *insamples)
             dst[0] = src[0]*name##_B0 + src[1]*name##_B1 + src[2]*name##_B2     \
                                       - dst[1]*name##_A1 - dst[2]*name##_A2;    \
 } while (0)
-
-            ebur128->x[ch * 3] = *samples++; // set X[i]
 
             // TODO: merge both filters in one?
             FILTER(y, x, PRE);  // apply pre-filter
@@ -505,7 +677,7 @@ static int filter_frame(AVFilterLink *inlink, AVFilterBufferRef *insamples)
             double power_400 = 1e-12, power_3000 = 1e-12;
             AVFilterLink *outlink = ctx->outputs[0];
             const int64_t pts = insamples->pts +
-                av_rescale_q(i, (AVRational){ 1, inlink->sample_rate },
+                av_rescale_q(idx_insample, (AVRational){ 1, inlink->sample_rate },
                              outlink->time_base);
 
             ebur128->sample_count = 0;
@@ -539,8 +711,13 @@ static int filter_frame(AVFilterLink *inlink, AVFilterBufferRef *insamples)
                     nb_integrated  += nb_v;
                     integrated_sum += nb_v * ebur128->i400.histogram[i].energy;
                 }
-                if (nb_integrated)
+                if (nb_integrated) {
                     ebur128->integrated_loudness = LOUDNESS(integrated_sum / nb_integrated);
+                    /* dual-mono correction */
+                    if (nb_channels == 1 && ebur128->dual_mono) {
+                        ebur128->integrated_loudness -= ebur128->pan_law;
+                    }
+                }
             }
 
             /* LRA */
@@ -587,15 +764,30 @@ static int filter_frame(AVFilterLink *inlink, AVFilterBufferRef *insamples)
                 }
             }
 
-#define LOG_FMT "M:%6.1f S:%6.1f     I:%6.1f LUFS     LRA:%6.1f LU"
+            /* dual-mono correction */
+            if (nb_channels == 1 && ebur128->dual_mono) {
+                loudness_400 -= ebur128->pan_law;
+                loudness_3000 -= ebur128->pan_law;
+            }
+
+#define LOG_FMT "TARGET:%d LUFS    M:%6.1f S:%6.1f     I:%6.1f %s       LRA:%6.1f LU"
 
             /* push one video frame */
             if (ebur128->do_video) {
+                AVFrame *clone;
                 int x, y, ret;
                 uint8_t *p;
+                double gauge_value;
+                int y_loudness_lu_graph, y_loudness_lu_gauge;
 
-                const int y_loudness_lu_graph = lu_to_y(ebur128, loudness_3000 + 23);
-                const int y_loudness_lu_gauge = lu_to_y(ebur128, loudness_400  + 23);
+                if (ebur128->gauge_type == GAUGE_TYPE_MOMENTARY) {
+                    gauge_value = loudness_400 - ebur128->target;
+                } else {
+                    gauge_value = loudness_3000 - ebur128->target;
+                }
+
+                y_loudness_lu_graph = lu_to_y(ebur128, loudness_3000 - ebur128->target);
+                y_loudness_lu_gauge = lu_to_y(ebur128, gauge_value);
 
                 /* draw the graph using the short-term loudness */
                 p = pic->data[0] + ebur128->graph.y*pic->linesize[0] + ebur128->graph.x*3;
@@ -607,7 +799,7 @@ static int filter_frame(AVFilterLink *inlink, AVFilterBufferRef *insamples)
                     p += pic->linesize[0];
                 }
 
-                /* draw the gauge using the momentary loudness */
+                /* draw the gauge using either momentary or short-term loudness */
                 p = pic->data[0] + ebur128->gauge.y*pic->linesize[0] + ebur128->gauge.x*3;
                 for (y = 0; y < ebur128->gauge.h; y++) {
                     const uint8_t *c = get_graph_color(ebur128, y_loudness_lu_gauge, y);
@@ -618,22 +810,84 @@ static int filter_frame(AVFilterLink *inlink, AVFilterBufferRef *insamples)
                 }
 
                 /* draw textual info */
-                drawtext(pic, PAD, PAD - PAD/2, FONT16, font_colors,
-                         LOG_FMT "     ", // padding to erase trailing characters
-                         loudness_400, loudness_3000,
-                         ebur128->integrated_loudness, ebur128->loudness_range);
+                if (ebur128->scale == SCALE_TYPE_ABSOLUTE) {
+                    drawtext(pic, PAD, PAD - PAD/2, FONT16, font_colors,
+                             LOG_FMT "     ", // padding to erase trailing characters
+                             ebur128->target, loudness_400, loudness_3000,
+                             ebur128->integrated_loudness, "LUFS", ebur128->loudness_range);
+                } else {
+                    drawtext(pic, PAD, PAD - PAD/2, FONT16, font_colors,
+                             LOG_FMT "     ", // padding to erase trailing characters
+                             ebur128->target, loudness_400-ebur128->target, loudness_3000-ebur128->target,
+                             ebur128->integrated_loudness-ebur128->target, "LU", ebur128->loudness_range);
+                }
 
                 /* set pts and push frame */
                 pic->pts = pts;
-                ret = ff_filter_frame(outlink, avfilter_ref_buffer(pic, ~AV_PERM_WRITE));
+                clone = av_frame_clone(pic);
+                if (!clone)
+                    return AVERROR(ENOMEM);
+                ret = ff_filter_frame(outlink, clone);
                 if (ret < 0)
                     return ret;
             }
 
-            av_log(ctx, ebur128->do_video ? AV_LOG_VERBOSE : AV_LOG_INFO,
-                   "t: %-10s " LOG_FMT "\n", av_ts2timestr(pts, &outlink->time_base),
-                   loudness_400, loudness_3000,
-                   ebur128->integrated_loudness, ebur128->loudness_range);
+            if (ebur128->metadata) { /* happens only once per filter_frame call */
+                char metabuf[128];
+#define META_PREFIX "lavfi.r128."
+
+#define SET_META(name, var) do {                                            \
+    snprintf(metabuf, sizeof(metabuf), "%.3f", var);                        \
+    av_dict_set(&insamples->metadata, name, metabuf, 0);                    \
+} while (0)
+
+#define SET_META_PEAK(name, ptype) do {                                     \
+    if (ebur128->peak_mode & PEAK_MODE_ ## ptype ## _PEAKS) {               \
+        char key[64];                                                       \
+        for (ch = 0; ch < nb_channels; ch++) {                              \
+            snprintf(key, sizeof(key),                                      \
+                     META_PREFIX AV_STRINGIFY(name) "_peaks_ch%d", ch);     \
+            SET_META(key, ebur128->name##_peaks[ch]);                       \
+        }                                                                   \
+    }                                                                       \
+} while (0)
+
+                SET_META(META_PREFIX "M",        loudness_400);
+                SET_META(META_PREFIX "S",        loudness_3000);
+                SET_META(META_PREFIX "I",        ebur128->integrated_loudness);
+                SET_META(META_PREFIX "LRA",      ebur128->loudness_range);
+                SET_META(META_PREFIX "LRA.low",  ebur128->lra_low);
+                SET_META(META_PREFIX "LRA.high", ebur128->lra_high);
+
+                SET_META_PEAK(sample, SAMPLES);
+                SET_META_PEAK(true,   TRUE);
+            }
+
+            if (ebur128->scale == SCALE_TYPE_ABSOLUTE) {
+                av_log(ctx, ebur128->loglevel, "t: %-10s " LOG_FMT,
+                       av_ts2timestr(pts, &outlink->time_base),
+                       ebur128->target, loudness_400, loudness_3000,
+                       ebur128->integrated_loudness, "LUFS", ebur128->loudness_range);
+            } else {
+                av_log(ctx, ebur128->loglevel, "t: %-10s " LOG_FMT,
+                       av_ts2timestr(pts, &outlink->time_base),
+                       ebur128->target, loudness_400-ebur128->target, loudness_3000-ebur128->target,
+                       ebur128->integrated_loudness-ebur128->target, "LU", ebur128->loudness_range);
+            }
+
+#define PRINT_PEAKS(str, sp, ptype) do {                            \
+    if (ebur128->peak_mode & PEAK_MODE_ ## ptype ## _PEAKS) {       \
+        av_log(ctx, ebur128->loglevel, "  " str ":");               \
+        for (ch = 0; ch < nb_channels; ch++)                        \
+            av_log(ctx, ebur128->loglevel, " %5.1f", DBFS(sp[ch])); \
+        av_log(ctx, ebur128->loglevel, " dBFS");                    \
+    }                                                               \
+} while (0)
+
+            PRINT_PEAKS("SPK", ebur128->sample_peaks, SAMPLES);
+            PRINT_PEAKS("FTPK", ebur128->true_peaks_per_frame, TRUE);
+            PRINT_PEAKS("TPK", ebur128->true_peaks,   TRUE);
+            av_log(ctx, ebur128->loglevel, "\n");
         }
     }
 
@@ -647,51 +901,37 @@ static int query_formats(AVFilterContext *ctx)
     AVFilterChannelLayouts *layouts;
     AVFilterLink *inlink = ctx->inputs[0];
     AVFilterLink *outlink = ctx->outputs[0];
+    int ret;
 
     static const enum AVSampleFormat sample_fmts[] = { AV_SAMPLE_FMT_DBL, AV_SAMPLE_FMT_NONE };
     static const int input_srate[] = {48000, -1}; // ITU-R BS.1770 provides coeff only for 48kHz
     static const enum AVPixelFormat pix_fmts[] = { AV_PIX_FMT_RGB24, AV_PIX_FMT_NONE };
 
-    /* set input audio formats */
-    formats = ff_make_format_list(sample_fmts);
-    if (!formats)
-        return AVERROR(ENOMEM);
-    ff_formats_ref(formats, &inlink->out_formats);
-
-    layouts = ff_all_channel_layouts();
-    if (!layouts)
-        return AVERROR(ENOMEM);
-    ff_channel_layouts_ref(layouts, &inlink->out_channel_layouts);
-
-    formats = ff_make_format_list(input_srate);
-    if (!formats)
-        return AVERROR(ENOMEM);
-    ff_formats_ref(formats, &inlink->out_samplerates);
-
     /* set optional output video format */
     if (ebur128->do_video) {
         formats = ff_make_format_list(pix_fmts);
-        if (!formats)
-            return AVERROR(ENOMEM);
-        ff_formats_ref(formats, &outlink->in_formats);
+        if ((ret = ff_formats_ref(formats, &outlink->in_formats)) < 0)
+            return ret;
         outlink = ctx->outputs[1];
     }
 
-    /* set audio output formats (same as input since it's just a passthrough) */
+    /* set input and output audio formats
+     * Note: ff_set_common_* functions are not used because they affect all the
+     * links, and thus break the video format negotiation */
     formats = ff_make_format_list(sample_fmts);
-    if (!formats)
-        return AVERROR(ENOMEM);
-    ff_formats_ref(formats, &outlink->in_formats);
+    if ((ret = ff_formats_ref(formats, &inlink->out_formats)) < 0 ||
+        (ret = ff_formats_ref(formats, &outlink->in_formats)) < 0)
+        return ret;
 
     layouts = ff_all_channel_layouts();
-    if (!layouts)
-        return AVERROR(ENOMEM);
-    ff_channel_layouts_ref(layouts, &outlink->in_channel_layouts);
+    if ((ret = ff_channel_layouts_ref(layouts, &inlink->out_channel_layouts)) < 0 ||
+        (ret = ff_channel_layouts_ref(layouts, &outlink->in_channel_layouts)) < 0)
+        return ret;
 
     formats = ff_make_format_list(input_srate);
-    if (!formats)
-        return AVERROR(ENOMEM);
-    ff_formats_ref(formats, &outlink->in_samplerates);
+    if ((ret = ff_formats_ref(formats, &inlink->out_samplerates)) < 0 ||
+        (ret = ff_formats_ref(formats, &outlink->in_samplerates)) < 0)
+        return ret;
 
     return 0;
 }
@@ -701,6 +941,14 @@ static av_cold void uninit(AVFilterContext *ctx)
     int i;
     EBUR128Context *ebur128 = ctx->priv;
 
+    /* dual-mono correction */
+    if (ebur128->nb_channels == 1 && ebur128->dual_mono) {
+        ebur128->i400.rel_threshold -= ebur128->pan_law;
+        ebur128->i3000.rel_threshold -= ebur128->pan_law;
+        ebur128->lra_low -= ebur128->pan_law;
+        ebur128->lra_high -= ebur128->pan_law;
+    }
+
     av_log(ctx, AV_LOG_INFO, "Summary:\n\n"
            "  Integrated loudness:\n"
            "    I:         %5.1f LUFS\n"
@@ -709,13 +957,33 @@ static av_cold void uninit(AVFilterContext *ctx)
            "    LRA:       %5.1f LU\n"
            "    Threshold: %5.1f LUFS\n"
            "    LRA low:   %5.1f LUFS\n"
-           "    LRA high:  %5.1f LUFS\n",
+           "    LRA high:  %5.1f LUFS",
            ebur128->integrated_loudness, ebur128->i400.rel_threshold,
            ebur128->loudness_range,      ebur128->i3000.rel_threshold,
            ebur128->lra_low, ebur128->lra_high);
 
+#define PRINT_PEAK_SUMMARY(str, sp, ptype) do {                  \
+    int ch;                                                      \
+    double maxpeak;                                              \
+    maxpeak = 0.0;                                               \
+    if (ebur128->peak_mode & PEAK_MODE_ ## ptype ## _PEAKS) {    \
+        for (ch = 0; ch < ebur128->nb_channels; ch++)            \
+            maxpeak = FFMAX(maxpeak, sp[ch]);                    \
+        av_log(ctx, AV_LOG_INFO, "\n\n  " str " peak:\n"         \
+               "    Peak:      %5.1f dBFS",                      \
+               DBFS(maxpeak));                                   \
+    }                                                            \
+} while (0)
+
+    PRINT_PEAK_SUMMARY("Sample", ebur128->sample_peaks, SAMPLES);
+    PRINT_PEAK_SUMMARY("True",   ebur128->true_peaks,   TRUE);
+    av_log(ctx, AV_LOG_INFO, "\n");
+
     av_freep(&ebur128->y_line_ref);
     av_freep(&ebur128->ch_weighting);
+    av_freep(&ebur128->true_peaks);
+    av_freep(&ebur128->sample_peaks);
+    av_freep(&ebur128->true_peaks_per_frame);
     av_freep(&ebur128->i400.histogram);
     av_freep(&ebur128->i3000.histogram);
     for (i = 0; i < ebur128->nb_channels; i++) {
@@ -724,20 +992,24 @@ static av_cold void uninit(AVFilterContext *ctx)
     }
     for (i = 0; i < ctx->nb_outputs; i++)
         av_freep(&ctx->output_pads[i].name);
-    avfilter_unref_bufferp(&ebur128->outpicref);
+    av_frame_free(&ebur128->outpicref);
+#if CONFIG_SWRESAMPLE
+    av_freep(&ebur128->swr_buf);
+    swr_free(&ebur128->swr_ctx);
+#endif
 }
 
 static const AVFilterPad ebur128_inputs[] = {
     {
-        .name             = "default",
-        .type             = AVMEDIA_TYPE_AUDIO,
-        .get_audio_buffer = ff_null_get_audio_buffer,
-        .filter_frame     = filter_frame,
+        .name         = "default",
+        .type         = AVMEDIA_TYPE_AUDIO,
+        .filter_frame = filter_frame,
+        .config_props = config_audio_input,
     },
     { NULL }
 };
 
-AVFilter avfilter_af_ebur128 = {
+AVFilter ff_af_ebur128 = {
     .name          = "ebur128",
     .description   = NULL_IF_CONFIG_SMALL("EBU R128 scanner."),
     .priv_size     = sizeof(EBUR128Context),
@@ -747,4 +1019,5 @@ AVFilter avfilter_af_ebur128 = {
     .inputs        = ebur128_inputs,
     .outputs       = NULL,
     .priv_class    = &ebur128_class,
+    .flags         = AVFILTER_FLAG_DYNAMIC_OUTPUTS,
 };

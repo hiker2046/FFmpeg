@@ -2,6 +2,8 @@
  * AU muxer and demuxer
  * Copyright (c) 2001 Fabrice Bellard
  *
+ * first version by Francois Revol <revol@free.fr>
+ *
  * This file is part of FFmpeg.
  *
  * FFmpeg is free software; you can redistribute it and/or
@@ -20,8 +22,6 @@
  */
 
 /*
- * First version by Francois Revol revol@free.fr
- *
  * Reference documents:
  * http://www.opengroup.org/public/pubs/external/auformat.html
  * http://www.goice.co.jp/member/mo/formats/au.html
@@ -31,86 +31,34 @@
 #include "internal.h"
 #include "avio_internal.h"
 #include "pcm.h"
+#include "libavutil/avassert.h"
 
 /* if we don't know the size in advance */
 #define AU_UNKNOWN_SIZE ((uint32_t)(~0))
 /* the specification requires an annotation field of at least eight bytes */
-#define AU_HEADER_SIZE (24+8)
+#define AU_DEFAULT_HEADER_SIZE (24+8)
 
-/* The libavcodec codecs we support, and the IDs they have in the file */
 static const AVCodecTag codec_au_tags[] = {
-    { AV_CODEC_ID_PCM_MULAW, 1 },
-    { AV_CODEC_ID_PCM_S8, 2 },
-    { AV_CODEC_ID_PCM_S16BE, 3 },
-    { AV_CODEC_ID_PCM_S24BE, 4 },
-    { AV_CODEC_ID_PCM_S32BE, 5 },
-    { AV_CODEC_ID_PCM_F32BE, 6 },
-    { AV_CODEC_ID_PCM_F64BE, 7 },
-    { AV_CODEC_ID_ADPCM_G722, 24 },
-    { AV_CODEC_ID_PCM_ALAW, 27 },
-    { AV_CODEC_ID_NONE, 0 },
+    { AV_CODEC_ID_PCM_MULAW,  1 },
+    { AV_CODEC_ID_PCM_S8,     2 },
+    { AV_CODEC_ID_PCM_S16BE,  3 },
+    { AV_CODEC_ID_PCM_S24BE,  4 },
+    { AV_CODEC_ID_PCM_S32BE,  5 },
+    { AV_CODEC_ID_PCM_F32BE,  6 },
+    { AV_CODEC_ID_PCM_F64BE,  7 },
+    { AV_CODEC_ID_ADPCM_G726LE, 23 },
+    { AV_CODEC_ID_ADPCM_G722,24 },
+    { AV_CODEC_ID_ADPCM_G726LE, 25 },
+    { AV_CODEC_ID_ADPCM_G726LE, 26 },
+    { AV_CODEC_ID_PCM_ALAW,  27 },
+    { AV_CODEC_ID_ADPCM_G726LE, MKBETAG('7','2','6','2') },
+    { AV_CODEC_ID_NONE,       0 },
 };
 
-#if CONFIG_AU_MUXER
-/* AUDIO_FILE header */
-static int put_au_header(AVIOContext *pb, AVCodecContext *enc)
+#if CONFIG_AU_DEMUXER
+
+static int au_probe(const AVProbeData *p)
 {
-    if(!enc->codec_tag)
-        return -1;
-    ffio_wfourcc(pb, ".snd");    /* magic number */
-    avio_wb32(pb, AU_HEADER_SIZE);  /* header size */
-    avio_wb32(pb, AU_UNKNOWN_SIZE); /* data size */
-    avio_wb32(pb, (uint32_t)enc->codec_tag);     /* codec ID */
-    avio_wb32(pb, enc->sample_rate);
-    avio_wb32(pb, (uint32_t)enc->channels);
-    avio_wb64(pb, 0); /* annotation field */
-    return 0;
-}
-
-static int au_write_header(AVFormatContext *s)
-{
-    AVIOContext *pb = s->pb;
-
-    /* format header */
-    if (put_au_header(pb, s->streams[0]->codec) < 0) {
-        return -1;
-    }
-
-    avio_flush(pb);
-
-    return 0;
-}
-
-static int au_write_packet(AVFormatContext *s, AVPacket *pkt)
-{
-    AVIOContext *pb = s->pb;
-    avio_write(pb, pkt->data, pkt->size);
-    return 0;
-}
-
-static int au_write_trailer(AVFormatContext *s)
-{
-    AVIOContext *pb = s->pb;
-    int64_t file_size;
-
-    if (s->pb->seekable) {
-
-        /* update file size */
-        file_size = avio_tell(pb);
-        avio_seek(pb, 8, SEEK_SET);
-        avio_wb32(pb, (uint32_t)(file_size - AU_HEADER_SIZE));
-        avio_seek(pb, file_size, SEEK_SET);
-
-        avio_flush(pb);
-    }
-
-    return 0;
-}
-#endif /* CONFIG_AU_MUXER */
-
-static int au_probe(AVProbeData *p)
-{
-    /* check file header */
     if (p->buf[0] == '.' && p->buf[1] == 's' &&
         p->buf[2] == 'n' && p->buf[3] == 'd')
         return AVPROBE_SCORE_MAX;
@@ -118,20 +66,87 @@ static int au_probe(AVProbeData *p)
         return 0;
 }
 
-/* au input */
+static int au_read_annotation(AVFormatContext *s, int size)
+{
+    static const char * keys[] = {
+        "title",
+        "artist",
+        "album",
+        "track",
+        "genre",
+        NULL };
+    AVIOContext *pb = s->pb;
+    enum { PARSE_KEY, PARSE_VALUE, PARSE_FINISHED } state = PARSE_KEY;
+    char c;
+    AVBPrint bprint;
+    char * key = NULL;
+    char * value = NULL;
+    int i;
+
+    av_bprint_init(&bprint, 64, AV_BPRINT_SIZE_UNLIMITED);
+
+    while (size-- > 0) {
+        c = avio_r8(pb);
+        switch(state) {
+        case PARSE_KEY:
+            if (c == '\0') {
+                state = PARSE_FINISHED;
+            } else if (c == '=') {
+                av_bprint_finalize(&bprint, &key);
+                av_bprint_init(&bprint, 64, AV_BPRINT_SIZE_UNLIMITED);
+                state = PARSE_VALUE;
+            } else {
+                av_bprint_chars(&bprint, c, 1);
+            }
+            break;
+        case PARSE_VALUE:
+            if (c == '\0' || c == '\n') {
+                if (av_bprint_finalize(&bprint, &value) != 0) {
+                    av_log(s, AV_LOG_ERROR, "Memory error while parsing AU metadata.\n");
+                } else {
+                    av_bprint_init(&bprint, 64, AV_BPRINT_SIZE_UNLIMITED);
+                    for (i = 0; keys[i] != NULL && key != NULL; i++) {
+                        if (av_strcasecmp(keys[i], key) == 0) {
+                            av_dict_set(&(s->metadata), keys[i], value, AV_DICT_DONT_STRDUP_VAL);
+                            av_freep(&key);
+                            value = NULL;
+                        }
+                    }
+                }
+                av_freep(&key);
+                av_freep(&value);
+                state = (c == '\0') ? PARSE_FINISHED : PARSE_KEY;
+            } else {
+                av_bprint_chars(&bprint, c, 1);
+            }
+            break;
+        case PARSE_FINISHED:
+            break;
+        default:
+            /* should never happen */
+            av_assert0(0);
+        }
+    }
+    av_bprint_finalize(&bprint, NULL);
+    av_freep(&key);
+    return 0;
+}
+
+#define BLOCK_SIZE 1024
+
 static int au_read_header(AVFormatContext *s)
 {
-    int size, bps, data_size = 0;
+    int size, data_size = 0;
     unsigned int tag;
     AVIOContext *pb = s->pb;
     unsigned int id, channels, rate;
+    int bps, ba = 0;
     enum AVCodecID codec;
     AVStream *st;
 
-    /* check ".snd" header */
     tag = avio_rl32(pb);
     if (tag != MKTAG('.', 's', 'n', 'd'))
-        return -1;
+        return AVERROR_INVALIDDATA;
     size = avio_rb32(pb); /* header size */
     data_size = avio_rb32(pb); /* data size in bytes */
 
@@ -140,66 +155,195 @@ static int au_read_header(AVFormatContext *s)
         return AVERROR_INVALIDDATA;
     }
 
-    id = avio_rb32(pb);
-    rate = avio_rb32(pb);
+    id       = avio_rb32(pb);
+    rate     = avio_rb32(pb);
     channels = avio_rb32(pb);
+
+    if (size > 24) {
+        /* parse annotation field to get metadata */
+        au_read_annotation(s, size - 24);
+    }
 
     codec = ff_codec_get_id(codec_au_tags, id);
 
-    if (!(bps = av_get_bits_per_sample(codec))) {
-        av_log_ask_for_sample(s, "could not determine bits per sample\n");
+    if (codec == AV_CODEC_ID_NONE) {
+        avpriv_request_sample(s, "unknown or unsupported codec tag: %u", id);
+        return AVERROR_PATCHWELCOME;
+    }
+
+    bps = av_get_bits_per_sample(codec);
+    if (codec == AV_CODEC_ID_ADPCM_G726LE) {
+        if (id == MKBETAG('7','2','6','2')) {
+            bps = 2;
+        } else {
+            const uint8_t bpcss[] = {4, 0, 3, 5};
+            av_assert0(id >= 23 && id < 23 + 4);
+            ba = bpcss[id - 23];
+            bps = bpcss[id - 23];
+        }
+    } else if (!bps) {
+        avpriv_request_sample(s, "Unknown bits per sample");
+        return AVERROR_PATCHWELCOME;
+    }
+
+    if (channels == 0 || channels >= INT_MAX / (BLOCK_SIZE * bps >> 3)) {
+        av_log(s, AV_LOG_ERROR, "Invalid number of channels %u\n", channels);
         return AVERROR_INVALIDDATA;
     }
 
-    if (channels == 0 || channels > 64) {
-        av_log(s, AV_LOG_ERROR, "Invalid number of channels %d\n", channels);
+    if (rate == 0 || rate > INT_MAX) {
+        av_log(s, AV_LOG_ERROR, "Invalid sample rate: %u\n", rate);
         return AVERROR_INVALIDDATA;
     }
 
-    if (size >= 24) {
-        /* skip unused data */
-        avio_skip(pb, size - 24);
-    }
-
-    /* now we are ready: build format streams */
     st = avformat_new_stream(s, NULL);
     if (!st)
-        return -1;
-    st->codec->codec_type = AVMEDIA_TYPE_AUDIO;
-    st->codec->codec_tag = id;
-    st->codec->codec_id = codec;
-    st->codec->channels = channels;
-    st->codec->sample_rate = rate;
-    st->codec->block_align = FFMAX(bps * st->codec->channels / 8, 1);
+        return AVERROR(ENOMEM);
+    st->codecpar->codec_type  = AVMEDIA_TYPE_AUDIO;
+    st->codecpar->codec_tag   = id;
+    st->codecpar->codec_id    = codec;
+    st->codecpar->channels    = channels;
+    st->codecpar->sample_rate = rate;
+    st->codecpar->bits_per_coded_sample = bps;
+    st->codecpar->bit_rate    = channels * rate * bps;
+    st->codecpar->block_align = ba ? ba : FFMAX(bps * st->codecpar->channels / 8, 1);
     if (data_size != AU_UNKNOWN_SIZE)
-    st->duration = (((int64_t)data_size)<<3) / (st->codec->channels * (int64_t)bps);
+        st->duration = (((int64_t)data_size)<<3) / (st->codecpar->channels * (int64_t)bps);
+
+    st->start_time = 0;
     avpriv_set_pts_info(st, 64, 1, rate);
+
     return 0;
 }
 
-#if CONFIG_AU_DEMUXER
 AVInputFormat ff_au_demuxer = {
-    .name           = "au",
-    .long_name      = NULL_IF_CONFIG_SMALL("Sun AU"),
-    .read_probe     = au_probe,
-    .read_header    = au_read_header,
-    .read_packet    = ff_pcm_read_packet,
-    .read_seek      = ff_pcm_read_seek,
-    .codec_tag      = (const AVCodecTag* const []){ codec_au_tags, 0 },
+    .name        = "au",
+    .long_name   = NULL_IF_CONFIG_SMALL("Sun AU"),
+    .read_probe  = au_probe,
+    .read_header = au_read_header,
+    .read_packet = ff_pcm_read_packet,
+    .read_seek   = ff_pcm_read_seek,
+    .codec_tag   = (const AVCodecTag* const []) { codec_au_tags, 0 },
 };
-#endif
+
+#endif /* CONFIG_AU_DEMUXER */
 
 #if CONFIG_AU_MUXER
+
+typedef struct AUContext {
+    uint32_t header_size;
+} AUContext;
+
+#include "rawenc.h"
+
+static int au_get_annotations(AVFormatContext *s, char **buffer)
+{
+    static const char * keys[] = {
+        "Title",
+        "Artist",
+        "Album",
+        "Track",
+        "Genre",
+        NULL };
+    int i;
+    int cnt = 0;
+    AVDictionary *m = s->metadata;
+    AVDictionaryEntry *t = NULL;
+    AVBPrint bprint;
+
+    av_bprint_init(&bprint, 64, AV_BPRINT_SIZE_UNLIMITED);
+
+    for (i = 0; keys[i] != NULL; i++) {
+        t = av_dict_get(m, keys[i], NULL, 0);
+        if (t != NULL) {
+            if (cnt++)
+                av_bprint_chars(&bprint, '\n', 1);
+            av_bprint_append_data(&bprint, keys[i], strlen(keys[i]));
+            av_bprint_chars(&bprint, '=', 1);
+            av_bprint_append_data(&bprint, t->value, strlen(t->value));
+        }
+    }
+    /* pad with 0's */
+    av_bprint_append_data(&bprint, "\0\0\0\0\0\0\0\0", 8);
+    return av_bprint_finalize(&bprint, buffer);
+}
+
+static int au_write_header(AVFormatContext *s)
+{
+    int ret;
+    AUContext *au = s->priv_data;
+    AVIOContext *pb = s->pb;
+    AVCodecParameters *par = s->streams[0]->codecpar;
+    char *annotations = NULL;
+
+    au->header_size = AU_DEFAULT_HEADER_SIZE;
+
+    if (s->nb_streams != 1) {
+        av_log(s, AV_LOG_ERROR, "only one stream is supported\n");
+        return AVERROR(EINVAL);
+    }
+
+    par->codec_tag = ff_codec_get_tag(codec_au_tags, par->codec_id);
+    if (!par->codec_tag) {
+        av_log(s, AV_LOG_ERROR, "unsupported codec\n");
+        return AVERROR(EINVAL);
+    }
+
+    if (av_dict_count(s->metadata) > 0) {
+        ret = au_get_annotations(s, &annotations);
+        if (ret < 0)
+            return ret;
+        if (annotations != NULL) {
+            au->header_size = (24 + strlen(annotations) + 8) & ~7;
+            if (au->header_size < AU_DEFAULT_HEADER_SIZE)
+                au->header_size = AU_DEFAULT_HEADER_SIZE;
+        }
+    }
+    ffio_wfourcc(pb, ".snd");                   /* magic number */
+    avio_wb32(pb, au->header_size);             /* header size */
+    avio_wb32(pb, AU_UNKNOWN_SIZE);             /* data size */
+    avio_wb32(pb, par->codec_tag);              /* codec ID */
+    avio_wb32(pb, par->sample_rate);
+    avio_wb32(pb, par->channels);
+    if (annotations != NULL) {
+        avio_write(pb, annotations, au->header_size - 24);
+        av_freep(&annotations);
+    } else {
+        avio_wb64(pb, 0); /* annotation field */
+    }
+
+    return 0;
+}
+
+static int au_write_trailer(AVFormatContext *s)
+{
+    AVIOContext *pb = s->pb;
+    AUContext *au = s->priv_data;
+    int64_t file_size = avio_tell(pb);
+
+    if ((s->pb->seekable & AVIO_SEEKABLE_NORMAL) && file_size < INT32_MAX) {
+        /* update file size */
+        avio_seek(pb, 8, SEEK_SET);
+        avio_wb32(pb, (uint32_t)(file_size - au->header_size));
+        avio_seek(pb, file_size, SEEK_SET);
+    }
+
+    return 0;
+}
+
 AVOutputFormat ff_au_muxer = {
-    .name              = "au",
-    .long_name         = NULL_IF_CONFIG_SMALL("Sun AU"),
-    .mime_type         = "audio/basic",
-    .extensions        = "au",
-    .audio_codec       = AV_CODEC_ID_PCM_S16BE,
-    .video_codec       = AV_CODEC_ID_NONE,
-    .write_header      = au_write_header,
-    .write_packet      = au_write_packet,
-    .write_trailer     = au_write_trailer,
-    .codec_tag         = (const AVCodecTag* const []){ codec_au_tags, 0 },
+    .name          = "au",
+    .long_name     = NULL_IF_CONFIG_SMALL("Sun AU"),
+    .mime_type     = "audio/basic",
+    .extensions    = "au",
+    .priv_data_size = sizeof(AUContext),
+    .audio_codec   = AV_CODEC_ID_PCM_S16BE,
+    .video_codec   = AV_CODEC_ID_NONE,
+    .write_header  = au_write_header,
+    .write_packet  = ff_raw_write_packet,
+    .write_trailer = au_write_trailer,
+    .codec_tag     = (const AVCodecTag* const []) { codec_au_tags, 0 },
+    .flags         = AVFMT_NOTIMESTAMPS,
 };
-#endif //CONFIG_AU_MUXER
+
+#endif /* CONFIG_AU_MUXER */

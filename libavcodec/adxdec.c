@@ -40,9 +40,9 @@ static av_cold int adx_decode_init(AVCodecContext *avctx)
     int ret, header_size;
 
     if (avctx->extradata_size >= 24) {
-        if ((ret = avpriv_adx_decode_header(avctx, avctx->extradata,
-                                            avctx->extradata_size, &header_size,
-                                            c->coeff)) < 0) {
+        if ((ret = ff_adx_decode_header(avctx, avctx->extradata,
+                                        avctx->extradata_size, &header_size,
+                                        c->coeff)) < 0) {
             av_log(avctx, AV_LOG_ERROR, "error parsing ADX header\n");
             return AVERROR_INVALIDDATA;
         }
@@ -51,9 +51,6 @@ static av_cold int adx_decode_init(AVCodecContext *avctx)
     }
 
     avctx->sample_fmt = AV_SAMPLE_FMT_S16P;
-
-    avcodec_get_frame_defaults(&c->frame);
-    avctx->coded_frame = &c->frame;
 
     return 0;
 }
@@ -84,7 +81,7 @@ static int adx_decode(ADXContext *c, int16_t *out, int offset,
     s2 = prev->s2;
     for (i = 0; i < BLOCK_SAMPLES; i++) {
         d  = get_sbits(&gb, 4);
-        s0 = ((d << COEFF_BITS) * scale + c->coeff[0] * s1 + c->coeff[1] * s2) >> COEFF_BITS;
+        s0 = d * scale + ((c->coeff[0] * s1 + c->coeff[1] * s2) >> COEFF_BITS);
         s2 = s1;
         s1 = av_clip_int16(s0);
         *out++ = s1;
@@ -98,6 +95,7 @@ static int adx_decode(ADXContext *c, int16_t *out, int offset,
 static int adx_decode_frame(AVCodecContext *avctx, void *data,
                             int *got_frame_ptr, AVPacket *avpkt)
 {
+    AVFrame *frame      = data;
     int buf_size        = avpkt->size;
     ADXContext *c       = avctx->priv_data;
     int16_t **samples;
@@ -113,8 +111,8 @@ static int adx_decode_frame(AVCodecContext *avctx, void *data,
 
     if (!c->header_parsed && buf_size >= 2 && AV_RB16(buf) == 0x8000) {
         int header_size;
-        if ((ret = avpriv_adx_decode_header(avctx, buf, buf_size, &header_size,
-                                            c->coeff)) < 0) {
+        if ((ret = ff_adx_decode_header(avctx, buf, buf_size, &header_size,
+                                        c->coeff)) < 0) {
             av_log(avctx, AV_LOG_ERROR, "error parsing ADX header\n");
             return AVERROR_INVALIDDATA;
         }
@@ -143,12 +141,10 @@ static int adx_decode_frame(AVCodecContext *avctx, void *data,
     }
 
     /* get output buffer */
-    c->frame.nb_samples = num_blocks * BLOCK_SAMPLES;
-    if ((ret = ff_get_buffer(avctx, &c->frame)) < 0) {
-        av_log(avctx, AV_LOG_ERROR, "get_buffer() failed\n");
+    frame->nb_samples = num_blocks * BLOCK_SAMPLES;
+    if ((ret = ff_get_buffer(avctx, frame, 0)) < 0)
         return ret;
-    }
-    samples = (int16_t **)c->frame.extended_data;
+    samples = (int16_t **)frame->extended_data;
     samples_offset = 0;
 
     while (num_blocks--) {
@@ -161,11 +157,12 @@ static int adx_decode_frame(AVCodecContext *avctx, void *data,
             buf_size -= BLOCK_SIZE;
             buf      += BLOCK_SIZE;
         }
-        samples_offset += BLOCK_SAMPLES;
+        if (!c->eof)
+            samples_offset += BLOCK_SAMPLES;
     }
 
-    *got_frame_ptr   = 1;
-    *(AVFrame *)data = c->frame;
+    frame->nb_samples = samples_offset;
+    *got_frame_ptr = 1;
 
     return buf - avpkt->data;
 }
@@ -179,14 +176,14 @@ static void adx_decode_flush(AVCodecContext *avctx)
 
 AVCodec ff_adpcm_adx_decoder = {
     .name           = "adpcm_adx",
+    .long_name      = NULL_IF_CONFIG_SMALL("SEGA CRI ADX ADPCM"),
     .type           = AVMEDIA_TYPE_AUDIO,
     .id             = AV_CODEC_ID_ADPCM_ADX,
     .priv_data_size = sizeof(ADXContext),
     .init           = adx_decode_init,
     .decode         = adx_decode_frame,
     .flush          = adx_decode_flush,
-    .capabilities   = CODEC_CAP_DR1,
-    .long_name      = NULL_IF_CONFIG_SMALL("SEGA CRI ADX ADPCM"),
+    .capabilities   = AV_CODEC_CAP_DR1,
     .sample_fmts    = (const enum AVSampleFormat[]) { AV_SAMPLE_FMT_S16P,
                                                       AV_SAMPLE_FMT_NONE },
 };

@@ -24,23 +24,24 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+#include "config.h"
+
+#include "libavutil/attributes.h"
 #include "libavutil/cpu.h"
-#include "libavutil/ppc/types_altivec.h"
+#include "libavutil/ppc/cpu.h"
 #include "libavutil/ppc/util_altivec.h"
-#include "libavcodec/dsputil.h"
+
 #include "libavcodec/mpegvideo.h"
 
-#include "dsputil_altivec.h"
+#if HAVE_ALTIVEC
 
 /* AltiVec version of dct_unquantize_h263
    this code assumes `block' is 16 bytes-aligned */
 static void dct_unquantize_h263_altivec(MpegEncContext *s,
-                                 DCTELEM *block, int n, int qscale)
+                                 int16_t *block, int n, int qscale)
 {
     int i, level, qmul, qadd;
     int nCoeffs;
-
-    assert(s->block_last_index[n]>=0);
 
     qadd = (qscale - 1) | 1;
     qmul = qscale << 1;
@@ -57,6 +58,7 @@ static void dct_unquantize_h263_altivec(MpegEncContext *s,
         nCoeffs= 63; //does not always use zigzag table
     } else {
         i = 0;
+        av_assert2(s->block_last_index[n]>=0);
         nCoeffs= s->intra_scantable.raster_end[ s->block_last_index[n] ];
     }
 
@@ -111,14 +113,18 @@ static void dct_unquantize_h263_altivec(MpegEncContext *s,
     }
 }
 
+#endif /* HAVE_ALTIVEC */
 
-void ff_MPV_common_init_altivec(MpegEncContext *s)
+av_cold void ff_mpv_common_init_ppc(MpegEncContext *s)
 {
-    if (!(av_get_cpu_flags() & AV_CPU_FLAG_ALTIVEC)) return;
+#if HAVE_ALTIVEC
+    if (!PPC_ALTIVEC(av_get_cpu_flags()))
+        return;
 
     if ((s->avctx->dct_algo == FF_DCT_AUTO) ||
-            (s->avctx->dct_algo == FF_DCT_ALTIVEC)) {
+        (s->avctx->dct_algo == FF_DCT_ALTIVEC)) {
         s->dct_unquantize_h263_intra = dct_unquantize_h263_altivec;
         s->dct_unquantize_h263_inter = dct_unquantize_h263_altivec;
     }
+#endif /* HAVE_ALTIVEC */
 }

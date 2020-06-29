@@ -26,9 +26,10 @@
  * fixed-point AC-3 encoder.
  */
 
-#define CONFIG_FFT_FLOAT 0
+#define FFT_FLOAT 0
 #undef CONFIG_AC3ENC_FLOAT
 #include "internal.h"
+#include "audiodsp.h"
 #include "ac3enc.h"
 #include "eac3enc.h"
 
@@ -41,45 +42,6 @@ static const AVClass ac3enc_class = {
     .option     = ac3_options,
     .version    = LIBAVUTIL_VERSION_INT,
 };
-
-#include "ac3enc_template.c"
-
-
-/**
- * Finalize MDCT and free allocated memory.
- *
- * @param s  AC-3 encoder private context
- */
-av_cold void AC3_NAME(mdct_end)(AC3EncodeContext *s)
-{
-    ff_mdct_end(&s->mdct);
-}
-
-
-/**
- * Initialize MDCT tables.
- *
- * @param s  AC-3 encoder private context
- * @return   0 on success, negative error code on failure
- */
-av_cold int AC3_NAME(mdct_init)(AC3EncodeContext *s)
-{
-    int ret = ff_mdct_init(&s->mdct, 9, 0, -1.0);
-    s->mdct_window = ff_ac3_window;
-    return ret;
-}
-
-
-/*
- * Apply KBD window to input samples prior to MDCT.
- */
-static void apply_window(void *dsp, int16_t *output, const int16_t *input,
-                         const int16_t *window, unsigned int len)
-{
-    DSPContext *dsp0 = dsp;
-    dsp0->apply_window_int16(output, input, window, len);
-}
-
 
 /*
  * Normalize the input samples to use the maximum available precision.
@@ -122,9 +84,10 @@ static void sum_square_butterfly(AC3EncodeContext *s, int64_t sum[4],
 /*
  * Clip MDCT coefficients to allowable range.
  */
-static void clip_coefficients(DSPContext *dsp, int32_t *coef, unsigned int len)
+static void clip_coefficients(AudioDSPContext *adsp, int32_t *coef,
+                              unsigned int len)
 {
-    dsp->vector_clip_int32(coef, coef, COEF_MIN, COEF_MAX, len);
+    adsp->vector_clip_int32(coef, coef, COEF_MIN, COEF_MAX, len);
 }
 
 
@@ -144,6 +107,34 @@ static CoefType calc_cpl_coord(CoefSumType energy_ch, CoefSumType energy_cpl)
 }
 
 
+#include "ac3enc_template.c"
+
+
+/**
+ * Finalize MDCT and free allocated memory.
+ *
+ * @param s  AC-3 encoder private context
+ */
+av_cold void ff_ac3_fixed_mdct_end(AC3EncodeContext *s)
+{
+    ff_mdct_end(&s->mdct);
+}
+
+
+/**
+ * Initialize MDCT tables.
+ *
+ * @param s  AC-3 encoder private context
+ * @return   0 on success, negative error code on failure
+ */
+av_cold int ff_ac3_fixed_mdct_init(AC3EncodeContext *s)
+{
+    int ret = ff_mdct_init(&s->mdct, 9, 0, -1.0);
+    s->mdct_window = ff_ac3_window;
+    return ret;
+}
+
+
 static av_cold int ac3_fixed_encode_init(AVCodecContext *avctx)
 {
     AC3EncodeContext *s = avctx->priv_data;
@@ -154,6 +145,7 @@ static av_cold int ac3_fixed_encode_init(AVCodecContext *avctx)
 
 AVCodec ff_ac3_fixed_encoder = {
     .name            = "ac3_fixed",
+    .long_name       = NULL_IF_CONFIG_SMALL("ATSC A/52A (AC-3)"),
     .type            = AVMEDIA_TYPE_AUDIO,
     .id              = AV_CODEC_ID_AC3,
     .priv_data_size  = sizeof(AC3EncodeContext),
@@ -162,8 +154,9 @@ AVCodec ff_ac3_fixed_encoder = {
     .close           = ff_ac3_encode_close,
     .sample_fmts     = (const enum AVSampleFormat[]){ AV_SAMPLE_FMT_S16P,
                                                       AV_SAMPLE_FMT_NONE },
-    .long_name       = NULL_IF_CONFIG_SMALL("ATSC A/52A (AC-3)"),
     .priv_class      = &ac3enc_class,
+    .caps_internal   = FF_CODEC_CAP_INIT_CLEANUP,
+    .supported_samplerates = ff_ac3_sample_rate_tab,
     .channel_layouts = ff_ac3_channel_layouts,
     .defaults        = ac3_defaults,
 };

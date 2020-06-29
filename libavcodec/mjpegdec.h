@@ -30,10 +30,16 @@
 #define AVCODEC_MJPEGDEC_H
 
 #include "libavutil/log.h"
+#include "libavutil/pixdesc.h"
+#include "libavutil/stereo3d.h"
 
 #include "avcodec.h"
+#include "blockdsp.h"
 #include "get_bits.h"
-#include "dsputil.h"
+#include "hpeldsp.h"
+#include "idctdsp.h"
+
+#undef near /* This file uses struct member 'near' which in windows.h is defined as empty. */
 
 #define MAX_COMPONENTS 4
 
@@ -41,12 +47,13 @@ typedef struct MJpegDecodeContext {
     AVClass *class;
     AVCodecContext *avctx;
     GetBitContext gb;
+    int buf_size;
 
     int start_code; /* current start code */
     int buffer_size;
     uint8_t *buffer;
 
-    int16_t quant_matrixes[4][64];
+    uint16_t quant_matrixes[4][64];
     VLC vlcs[3][4];
     int qscale[4];      ///< quantizer scale calculated from quant_matrixes
 
@@ -57,13 +64,16 @@ typedef struct MJpegDecodeContext {
     int lossless;
     int ls;
     int progressive;
+    int bayer;          /* true if it's a bayer-encoded JPEG embedded in a DNG */
     int rgb;
-    int upscale_h;
-    int chroma_height;
-    int upscale_v;
+    uint8_t upscale_h[4];
+    uint8_t upscale_v[4];
     int rct;            /* standard rct */
     int pegasus_rct;    /* pegasus reversible colorspace transform */
     int bits;           /* bits per component */
+    int colr;
+    int xfrm;
+    int adobe_transform;
 
     int maxval;
     int near;         ///< near lossless bound (si 0 for lossless)
@@ -83,20 +93,24 @@ typedef struct MJpegDecodeContext {
     int nb_blocks[MAX_COMPONENTS];
     int h_scount[MAX_COMPONENTS];
     int v_scount[MAX_COMPONENTS];
+    int quant_sindex[MAX_COMPONENTS];
     int h_max, v_max; /* maximum h and v counts */
     int quant_index[4];   /* quant table index for each component */
     int last_dc[MAX_COMPONENTS]; /* last DEQUANTIZED dc (XXX: am I right to do that ?) */
-    AVFrame picture; /* picture structure */
+    AVFrame *picture; /* picture structure */
     AVFrame *picture_ptr; /* pointer to picture structure */
     int got_picture;                                ///< we found a SOF and picture is valid, too.
     int linesize[MAX_COMPONENTS];                   ///< linesize << interlaced
     int8_t *qscale_table;
-    DECLARE_ALIGNED(16, DCTELEM, block)[64];
-    DCTELEM (*blocks[MAX_COMPONENTS])[64]; ///< intermediate sums (progressive mode)
+    DECLARE_ALIGNED(32, int16_t, block)[64];
+    int16_t (*blocks[MAX_COMPONENTS])[64]; ///< intermediate sums (progressive mode)
     uint8_t *last_nnz[MAX_COMPONENTS];
     uint64_t coefs_finished[MAX_COMPONENTS]; ///< bitmask of which coefs have been completely decoded (progressive mode)
+    int palette_index;
     ScanTable scantable;
-    DSPContext dsp;
+    BlockDSPContext bdsp;
+    HpelDSPContext hdsp;
+    IDCTDSPContext idsp;
 
     int restart_interval;
     int restart_count;
@@ -104,6 +118,7 @@ typedef struct MJpegDecodeContext {
     int buggy_avid;
     int cs_itu601;
     int interlace_polarity;
+    int multiscope;
 
     int mjpb_skiptosod;
 
@@ -114,6 +129,29 @@ typedef struct MJpegDecodeContext {
     unsigned int ljpeg_buffer_size;
 
     int extern_huff;
+    AVDictionary *exif_metadata;
+
+    AVStereo3D *stereo3d; ///!< stereoscopic information (cached, since it is read before frame allocation)
+
+    const AVPixFmtDescriptor *pix_desc;
+
+    uint8_t **iccdata;
+    int *iccdatalens;
+    int iccnum;
+    int iccread;
+
+    // Raw stream data for hwaccel use.
+    const uint8_t *raw_image_buffer;
+    size_t         raw_image_buffer_size;
+    const uint8_t *raw_scan_buffer;
+    size_t         raw_scan_buffer_size;
+
+    uint8_t raw_huffman_lengths[2][4][16];
+    uint8_t raw_huffman_values[2][4][256];
+
+    enum AVPixelFormat hwaccel_sw_pix_fmt;
+    enum AVPixelFormat hwaccel_pix_fmt;
+    void *hwaccel_picture_private;
 } MJpegDecodeContext;
 
 int ff_mjpeg_decode_init(AVCodecContext *avctx);
@@ -125,7 +163,8 @@ int ff_mjpeg_decode_dqt(MJpegDecodeContext *s);
 int ff_mjpeg_decode_dht(MJpegDecodeContext *s);
 int ff_mjpeg_decode_sof(MJpegDecodeContext *s);
 int ff_mjpeg_decode_sos(MJpegDecodeContext *s,
-                        const uint8_t *mb_bitmask, const AVFrame *reference);
+                        const uint8_t *mb_bitmask,int mb_bitmask_size,
+                        const AVFrame *reference);
 int ff_mjpeg_find_marker(MJpegDecodeContext *s,
                          const uint8_t **buf_ptr, const uint8_t *buf_end,
                          const uint8_t **unescaped_buf_ptr, int *unescaped_buf_size);

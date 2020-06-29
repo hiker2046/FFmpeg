@@ -65,7 +65,7 @@ void ff_acelp_filter_init_mips(ACELPFContext *c);
  * the coefficients are scaled by 2^15.
  * This array only contains the right half of the filter.
  * This filter is likely identical to the one used in G.729, though this
- * could not be determined from the original comments with certainity.
+ * could not be determined from the original comments with certainty.
  */
 extern const int16_t ff_acelp_interp_filter[61];
 
@@ -82,7 +82,6 @@ extern const int16_t ff_acelp_interp_filter[61];
  * filter_coeffs contains coefficients of the right half of the symmetric
  * interpolation filter. filter_coeffs[0] should the central (unpaired) coefficient.
  * See ff_acelp_interp_filter for an example.
- *
  */
 void ff_acelp_interpolate(int16_t* out, const int16_t* in,
                           const int16_t* filter_coeffs, int precision,

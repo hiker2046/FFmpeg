@@ -20,25 +20,18 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <inttypes.h>
+
 #include "libavutil/imgutils.h"
 #include "avcodec.h"
 #include "bytestream.h"
 #include "internal.h"
 #include "xwd.h"
 
-static av_cold int xwd_decode_init(AVCodecContext *avctx)
-{
-    avctx->coded_frame = avcodec_alloc_frame();
-    if (!avctx->coded_frame)
-        return AVERROR(ENOMEM);
-
-    return 0;
-}
-
 static int xwd_decode_frame(AVCodecContext *avctx, void *data,
                             int *got_frame, AVPacket *avpkt)
 {
-    AVFrame *p = avctx->coded_frame;
+    AVFrame *p = data;
     const uint8_t *buf = avpkt->data;
     int i, ret, buf_size = avpkt->size;
     uint32_t version, header_size, vclass, ncolors;
@@ -46,6 +39,7 @@ static int xwd_decode_frame(AVCodecContext *avctx, void *data,
     uint32_t pixformat, pixdepth, bunit, bitorder, bpad;
     uint32_t rgb[3];
     uint8_t *ptr;
+    int width, height;
     GetByteContext gb;
 
     if (buf_size < XWD_HEADER_SIZE)
@@ -67,8 +61,8 @@ static int xwd_decode_frame(AVCodecContext *avctx, void *data,
 
     pixformat     = bytestream2_get_be32u(&gb);
     pixdepth      = bytestream2_get_be32u(&gb);
-    avctx->width  = bytestream2_get_be32u(&gb);
-    avctx->height = bytestream2_get_be32u(&gb);
+    width         = bytestream2_get_be32u(&gb);
+    height        = bytestream2_get_be32u(&gb);
     xoffset       = bytestream2_get_be32u(&gb);
     be            = bytestream2_get_be32u(&gb);
     bunit         = bytestream2_get_be32u(&gb);
@@ -84,11 +78,18 @@ static int xwd_decode_frame(AVCodecContext *avctx, void *data,
     ncolors       = bytestream2_get_be32u(&gb);
     bytestream2_skipu(&gb, header_size - (XWD_HEADER_SIZE - 20));
 
-    av_log(avctx, AV_LOG_DEBUG, "pixformat %d, pixdepth %d, bunit %d, bitorder %d, bpad %d\n",
+    if ((ret = ff_set_dimensions(avctx, width, height)) < 0)
+        return ret;
+
+    av_log(avctx, AV_LOG_DEBUG,
+           "pixformat %"PRIu32", pixdepth %"PRIu32", bunit %"PRIu32", bitorder %"PRIu32", bpad %"PRIu32"\n",
            pixformat, pixdepth, bunit, bitorder, bpad);
-    av_log(avctx, AV_LOG_DEBUG, "vclass %d, ncolors %d, bpp %d, be %d, lsize %d, xoffset %d\n",
+    av_log(avctx, AV_LOG_DEBUG,
+           "vclass %"PRIu32", ncolors %"PRIu32", bpp %"PRIu32", be %"PRIu32", lsize %"PRIu32", xoffset %"PRIu32"\n",
            vclass, ncolors, bpp, be, lsize, xoffset);
-    av_log(avctx, AV_LOG_DEBUG, "red %0x, green %0x, blue %0x\n", rgb[0], rgb[1], rgb[2]);
+    av_log(avctx, AV_LOG_DEBUG,
+           "red %0"PRIx32", green %0"PRIx32", blue %0"PRIx32"\n",
+           rgb[0], rgb[1], rgb[2]);
 
     if (pixformat > XWD_Z_PIXMAP) {
         av_log(avctx, AV_LOG_ERROR, "invalid pixmap format\n");
@@ -101,7 +102,7 @@ static int xwd_decode_frame(AVCodecContext *avctx, void *data,
     }
 
     if (xoffset) {
-        av_log_ask_for_sample(avctx, "unsupported xoffset %d\n", xoffset);
+        avpriv_request_sample(avctx, "xoffset %"PRIu32"", xoffset);
         return AVERROR_PATCHWELCOME;
     }
 
@@ -144,13 +145,13 @@ static int xwd_decode_frame(AVCodecContext *avctx, void *data,
         return AVERROR_INVALIDDATA;
     }
 
-    if (bytestream2_get_bytes_left(&gb) < ncolors * XWD_CMAP_SIZE + avctx->height * lsize) {
+    if (bytestream2_get_bytes_left(&gb) < ncolors * XWD_CMAP_SIZE + (uint64_t)avctx->height * lsize) {
         av_log(avctx, AV_LOG_ERROR, "input buffer too small\n");
         return AVERROR_INVALIDDATA;
     }
 
     if (pixformat != XWD_Z_PIXMAP) {
-        av_log(avctx, AV_LOG_ERROR, "pixmap format %d unsupported\n", pixformat);
+        avpriv_report_missing_feature(avctx, "Pixmap format %"PRIu32, pixformat);
         return AVERROR_PATCHWELCOME;
     }
 
@@ -160,9 +161,9 @@ static int xwd_decode_frame(AVCodecContext *avctx, void *data,
     case XWD_GRAY_SCALE:
         if (bpp != 1 && bpp != 8)
             return AVERROR_INVALIDDATA;
-        if (pixdepth == 1) {
+        if (bpp == 1 && pixdepth == 1) {
             avctx->pix_fmt = AV_PIX_FMT_MONOWHITE;
-        } else if (pixdepth == 8) {
+        } else if (bpp == 8 && pixdepth == 8) {
             avctx->pix_fmt = AV_PIX_FMT_GRAY8;
         }
         break;
@@ -204,18 +205,14 @@ static int xwd_decode_frame(AVCodecContext *avctx, void *data,
     }
 
     if (avctx->pix_fmt == AV_PIX_FMT_NONE) {
-        av_log_ask_for_sample(avctx, "unknown file: bpp %d, pixdepth %d, vclass %d\n", bpp, pixdepth, vclass);
+        avpriv_request_sample(avctx,
+                              "Unknown file: bpp %"PRIu32", pixdepth %"PRIu32", vclass %"PRIu32"",
+                              bpp, pixdepth, vclass);
         return AVERROR_PATCHWELCOME;
     }
 
-    if (p->data[0])
-        avctx->release_buffer(avctx, p);
-
-    p->reference = 0;
-    if ((ret = ff_get_buffer(avctx, p)) < 0) {
-        av_log(avctx, AV_LOG_ERROR, "get_buffer() failed\n");
+    if ((ret = ff_get_buffer(avctx, p, 0)) < 0)
         return ret;
-    }
 
     p->key_frame = 1;
     p->pict_type = AV_PICTURE_TYPE_I;
@@ -234,7 +231,7 @@ static int xwd_decode_frame(AVCodecContext *avctx, void *data,
             blue   = bytestream2_get_byteu(&gb);
             bytestream2_skipu(&gb, 3); // skip bitmask flag and padding
 
-            dst[i] = red << 16 | green << 8 | blue;
+            dst[i] = 0xFFU << 24 | red << 16 | green << 8 | blue;
         }
     }
 
@@ -246,28 +243,15 @@ static int xwd_decode_frame(AVCodecContext *avctx, void *data,
     }
 
     *got_frame       = 1;
-    *(AVFrame *)data = *p;
 
     return buf_size;
 }
 
-static av_cold int xwd_decode_close(AVCodecContext *avctx)
-{
-    if (avctx->coded_frame->data[0])
-        avctx->release_buffer(avctx, avctx->coded_frame);
-
-    av_freep(&avctx->coded_frame);
-
-    return 0;
-}
-
 AVCodec ff_xwd_decoder = {
     .name           = "xwd",
+    .long_name      = NULL_IF_CONFIG_SMALL("XWD (X Window Dump) image"),
     .type           = AVMEDIA_TYPE_VIDEO,
     .id             = AV_CODEC_ID_XWD,
-    .init           = xwd_decode_init,
-    .close          = xwd_decode_close,
     .decode         = xwd_decode_frame,
-    .capabilities   = CODEC_CAP_DR1,
-    .long_name      = NULL_IF_CONFIG_SMALL("XWD (X Window Dump) image"),
+    .capabilities   = AV_CODEC_CAP_DR1,
 };

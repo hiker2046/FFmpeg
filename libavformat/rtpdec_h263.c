@@ -21,15 +21,16 @@
 
 #include "avformat.h"
 #include "rtpdec_formats.h"
+#include "libavutil/attributes.h"
 #include "libavutil/intreadwrite.h"
 
 int ff_h263_handle_packet(AVFormatContext *ctx, PayloadContext *data,
                           AVStream *st, AVPacket *pkt, uint32_t *timestamp,
-                          const uint8_t *buf, int len, int flags)
+                          const uint8_t *buf, int len, uint16_t seq, int flags)
 {
     uint8_t *ptr;
     uint16_t header;
-    int startcode, vrc, picture_header;
+    int startcode, vrc, picture_header, ret;
 
     if (len < 2) {
         av_log(ctx, AV_LOG_ERROR, "Too short H.263 RTP packet\n");
@@ -72,9 +73,9 @@ int ff_h263_handle_packet(AVFormatContext *ctx, PayloadContext *data,
         return AVERROR_INVALIDDATA;
     }
 
-    if (av_new_packet(pkt, len + startcode)) {
+    if ((ret = av_new_packet(pkt, len + startcode)) < 0) {
         av_log(ctx, AV_LOG_ERROR, "Out of memory\n");
-        return AVERROR(ENOMEM);
+        return ret;
     }
     pkt->stream_index = st->index;
     ptr = pkt->data;
@@ -88,16 +89,18 @@ int ff_h263_handle_packet(AVFormatContext *ctx, PayloadContext *data,
     return 0;
 }
 
-RTPDynamicProtocolHandler ff_h263_1998_dynamic_handler = {
+const RTPDynamicProtocolHandler ff_h263_1998_dynamic_handler = {
     .enc_name         = "H263-1998",
     .codec_type       = AVMEDIA_TYPE_VIDEO,
     .codec_id         = AV_CODEC_ID_H263,
+    .need_parsing     = AVSTREAM_PARSE_FULL,
     .parse_packet     = ff_h263_handle_packet,
 };
 
-RTPDynamicProtocolHandler ff_h263_2000_dynamic_handler = {
+const RTPDynamicProtocolHandler ff_h263_2000_dynamic_handler = {
     .enc_name         = "H263-2000",
     .codec_type       = AVMEDIA_TYPE_VIDEO,
     .codec_id         = AV_CODEC_ID_H263,
+    .need_parsing     = AVSTREAM_PARSE_FULL,
     .parse_packet     = ff_h263_handle_packet,
 };

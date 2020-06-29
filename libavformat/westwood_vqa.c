@@ -1,6 +1,6 @@
 /*
  * Westwood Studios VQA Format Demuxer
- * Copyright (c) 2003 The ffmpeg Project
+ * Copyright (c) 2003 The FFmpeg project
  *
  * This file is part of FFmpeg.
  *
@@ -62,7 +62,7 @@ typedef struct WsVqaDemuxContext {
     int video_stream_index;
 } WsVqaDemuxContext;
 
-static int wsvqa_probe(AVProbeData *p)
+static int wsvqa_probe(const AVProbeData *p)
 {
     /* need 12 bytes to qualify */
     if (p->buf_size < 12)
@@ -81,11 +81,11 @@ static int wsvqa_read_header(AVFormatContext *s)
     WsVqaDemuxContext *wsvqa = s->priv_data;
     AVIOContext *pb = s->pb;
     AVStream *st;
-    unsigned char *header;
-    unsigned char scratch[VQA_PREAMBLE_SIZE];
-    unsigned int chunk_tag;
-    unsigned int chunk_size;
-    int fps;
+    uint8_t *header;
+    uint8_t scratch[VQA_PREAMBLE_SIZE];
+    uint32_t chunk_tag;
+    uint32_t chunk_size;
+    int fps, ret;
 
     /* initialize the video decoder stream */
     st = avformat_new_stream(s, NULL);
@@ -93,24 +93,19 @@ static int wsvqa_read_header(AVFormatContext *s)
         return AVERROR(ENOMEM);
     st->start_time = 0;
     wsvqa->video_stream_index = st->index;
-    st->codec->codec_type = AVMEDIA_TYPE_VIDEO;
-    st->codec->codec_id = AV_CODEC_ID_WS_VQA;
-    st->codec->codec_tag = 0;  /* no fourcc */
+    st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+    st->codecpar->codec_id = AV_CODEC_ID_WS_VQA;
+    st->codecpar->codec_tag = 0;  /* no fourcc */
 
     /* skip to the start of the VQA header */
     avio_seek(pb, 20, SEEK_SET);
 
     /* the VQA header needs to go to the decoder */
-    st->codec->extradata_size = VQA_HEADER_SIZE;
-    st->codec->extradata = av_mallocz(VQA_HEADER_SIZE + FF_INPUT_BUFFER_PADDING_SIZE);
-    header = (unsigned char *)st->codec->extradata;
-    if (avio_read(pb, st->codec->extradata, VQA_HEADER_SIZE) !=
-        VQA_HEADER_SIZE) {
-        av_free(st->codec->extradata);
-        return AVERROR(EIO);
-    }
-    st->codec->width = AV_RL16(&header[6]);
-    st->codec->height = AV_RL16(&header[8]);
+    if ((ret = ff_get_extradata(s, st->codecpar, pb, VQA_HEADER_SIZE)) < 0)
+        return ret;
+    header = st->codecpar->extradata;
+    st->codecpar->width = AV_RL16(&header[6]);
+    st->codecpar->height = AV_RL16(&header[8]);
     fps = header[12];
     st->nb_frames =
     st->duration  = AV_RL16(&header[4]);
@@ -136,7 +131,7 @@ static int wsvqa_read_header(AVFormatContext *s)
         chunk_tag = AV_RB32(&scratch[0]);
         chunk_size = AV_RB32(&scratch[4]);
 
-        /* catch any unknown header tags, for curiousity */
+        /* catch any unknown header tags, for curiosity */
         switch (chunk_tag) {
         case CINF_TAG:
         case CINH_TAG:
@@ -149,9 +144,8 @@ static int wsvqa_read_header(AVFormatContext *s)
             break;
 
         default:
-            av_log (s, AV_LOG_ERROR, " note: unknown chunk seen (%c%c%c%c)\n",
-                scratch[0], scratch[1],
-                scratch[2], scratch[3]);
+            av_log(s, AV_LOG_ERROR, " note: unknown chunk seen (%s)\n",
+                   av_fourcc2str(chunk_tag));
             break;
         }
 
@@ -167,9 +161,9 @@ static int wsvqa_read_packet(AVFormatContext *s,
     WsVqaDemuxContext *wsvqa = s->priv_data;
     AVIOContext *pb = s->pb;
     int ret = -1;
-    unsigned char preamble[VQA_PREAMBLE_SIZE];
-    unsigned int chunk_type;
-    unsigned int chunk_size;
+    uint8_t preamble[VQA_PREAMBLE_SIZE];
+    uint32_t chunk_type;
+    uint32_t chunk_size;
     int skip_byte;
 
     while (avio_read(pb, preamble, VQA_PREAMBLE_SIZE) == VQA_PREAMBLE_SIZE) {
@@ -201,30 +195,28 @@ static int wsvqa_read_packet(AVFormatContext *s,
                         wsvqa->channels = 1;
                     if (!wsvqa->bps)
                         wsvqa->bps = 8;
-                    st->codec->sample_rate = wsvqa->sample_rate;
-                    st->codec->bits_per_coded_sample = wsvqa->bps;
-                    st->codec->channels = wsvqa->channels;
-                    st->codec->codec_type = AVMEDIA_TYPE_AUDIO;
+                    st->codecpar->sample_rate = wsvqa->sample_rate;
+                    st->codecpar->bits_per_coded_sample = wsvqa->bps;
+                    st->codecpar->channels = wsvqa->channels;
+                    st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
 
-                    avpriv_set_pts_info(st, 64, 1, st->codec->sample_rate);
+                    avpriv_set_pts_info(st, 64, 1, st->codecpar->sample_rate);
 
                     switch (chunk_type) {
                     case SND0_TAG:
                         if (wsvqa->bps == 16)
-                            st->codec->codec_id = AV_CODEC_ID_PCM_S16LE;
+                            st->codecpar->codec_id = AV_CODEC_ID_PCM_S16LE;
                         else
-                            st->codec->codec_id = AV_CODEC_ID_PCM_U8;
+                            st->codecpar->codec_id = AV_CODEC_ID_PCM_U8;
                         break;
                     case SND1_TAG:
-                        st->codec->codec_id = AV_CODEC_ID_WESTWOOD_SND1;
+                        st->codecpar->codec_id = AV_CODEC_ID_WESTWOOD_SND1;
                         break;
                     case SND2_TAG:
-                        st->codec->codec_id = AV_CODEC_ID_ADPCM_IMA_WS;
-                        st->codec->extradata_size = 2;
-                        st->codec->extradata = av_mallocz(2 + FF_INPUT_BUFFER_PADDING_SIZE);
-                        if (!st->codec->extradata)
-                            return AVERROR(ENOMEM);
-                        AV_WL16(st->codec->extradata, wsvqa->version);
+                        st->codecpar->codec_id = AV_CODEC_ID_ADPCM_IMA_WS;
+                        if ((ret = ff_alloc_extradata(st->codecpar, 2)) < 0)
+                            return ret;
+                        AV_WL16(st->codecpar->extradata, wsvqa->version);
                         break;
                     }
                 }
@@ -258,7 +250,8 @@ static int wsvqa_read_packet(AVFormatContext *s,
             case CMDS_TAG:
                 break;
             default:
-                av_log(s, AV_LOG_INFO, "Skipping unknown chunk 0x%08X\n", chunk_type);
+                av_log(s, AV_LOG_INFO, "Skipping unknown chunk %s\n",
+                       av_fourcc2str(av_bswap32(chunk_type)));
             }
             avio_skip(pb, chunk_size + skip_byte);
         }

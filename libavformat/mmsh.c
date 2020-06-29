@@ -41,7 +41,7 @@
 // see Ref 2.2.1.8
 #define USERAGENT  "User-Agent: NSPlayer/4.1.0.3856\r\n"
 // see Ref 2.2.1.4.33
-// the guid value can be changed to any valid value.
+// the GUID value can be changed to any valid value.
 #define CLIENTGUID "Pragma: xClientGUID={c77e7400-738a-11d2-9add-0020af0a3278}\r\n"
 
 // see Ref 2.2.3 for packet type define:
@@ -54,7 +54,7 @@ typedef enum {
     CHUNK_TYPE_STREAM_CHANGE = 0x4324,
 } ChunkType;
 
-typedef struct {
+typedef struct MMSHContext {
     MMSContext mms;
     uint8_t location[1024];
     int request_seq;  ///< request packet sequence
@@ -65,10 +65,9 @@ static int mmsh_close(URLContext *h)
 {
     MMSHContext *mmsh = (MMSHContext *)h->priv_data;
     MMSContext *mms   = &mmsh->mms;
-    if (mms->mms_hd)
-        ffurl_close(mms->mms_hd);
-    av_free(mms->streams);
-    av_free(mms->asf_header);
+    ffurl_closep(&mms->mms_hd);
+    av_freep(&mms->streams);
+    av_freep(&mms->asf_header);
     return 0;
 }
 
@@ -119,12 +118,12 @@ static int read_data_packet(MMSHContext *mmsh, const int len)
     int res;
     if (len > sizeof(mms->in_buffer)) {
         av_log(NULL, AV_LOG_ERROR,
-               "Data packet length %d exceeds the in_buffer size %zu\n",
+               "Data packet length %d exceeds the in_buffer size %"SIZE_SPECIFIER"\n",
                len, sizeof(mms->in_buffer));
         return AVERROR(EIO);
     }
     res = ffurl_read_complete(mms->mms_hd, mms->in_buffer, len);
-    av_dlog(NULL, "Data packet len = %d\n", len);
+    av_log(NULL, AV_LOG_TRACE, "Data packet len = %d\n", len);
     if (res != len) {
         av_log(NULL, AV_LOG_ERROR, "Read data packet failed!\n");
         return AVERROR(EIO);
@@ -158,7 +157,7 @@ static int get_http_header_data(MMSHContext *mmsh)
                 if (mms->asf_header) {
                     if (len != mms->asf_header_size) {
                         mms->asf_header_size = len;
-                        av_dlog(NULL, "Header len changed from %d to %d\n",
+                        av_log(NULL, AV_LOG_TRACE, "Header len changed from %d to %d\n",
                                 mms->asf_header_size, len);
                         av_freep(&mms->asf_header);
                     }
@@ -194,7 +193,7 @@ static int get_http_header_data(MMSHContext *mmsh)
             if (len) {
                 if (len > sizeof(mms->in_buffer)) {
                     av_log(NULL, AV_LOG_ERROR,
-                           "Other packet len = %d exceed the in_buffer size %zu\n",
+                           "Other packet len = %d exceed the in_buffer size %"SIZE_SPECIFIER"\n",
                            len, sizeof(mms->in_buffer));
                     return AVERROR(EIO);
                 }
@@ -203,7 +202,7 @@ static int get_http_header_data(MMSHContext *mmsh)
                     av_log(NULL, AV_LOG_ERROR, "Read other chunk type data failed!\n");
                     return AVERROR(EIO);
                 } else {
-                    av_dlog(NULL, "Skip chunk type %d \n", chunk_type);
+                    av_log(NULL, AV_LOG_TRACE, "Skip chunk type %d \n", chunk_type);
                     continue;
                 }
             }
@@ -246,6 +245,14 @@ static int mmsh_open_internal(URLContext *h, const char *uri, int flags, int tim
              host, port, mmsh->request_seq++);
     av_opt_set(mms->mms_hd->priv_data, "headers", headers, 0);
 
+    if (!mms->mms_hd->protocol_whitelist && h->protocol_whitelist) {
+        mms->mms_hd->protocol_whitelist = av_strdup(h->protocol_whitelist);
+        if (!mms->mms_hd->protocol_whitelist) {
+            err = AVERROR(ENOMEM);
+            goto fail;
+        }
+    }
+
     err = ffurl_connect(mms->mms_hd, NULL);
     if (err) {
         goto fail;
@@ -257,7 +264,7 @@ static int mmsh_open_internal(URLContext *h, const char *uri, int flags, int tim
     }
 
     // close the socket and then reopen it for sending the second play request.
-    ffurl_close(mms->mms_hd);
+    ffurl_closep(&mms->mms_hd);
     memset(headers, 0, sizeof(headers));
     if ((err = ffurl_alloc(&mms->mms_hd, httpname, AVIO_FLAG_READ,
                            &h->interrupt_callback)) < 0) {
@@ -291,7 +298,7 @@ static int mmsh_open_internal(URLContext *h, const char *uri, int flags, int tim
         av_log(NULL, AV_LOG_ERROR, "Build play request failed!\n");
         goto fail;
     }
-    av_dlog(NULL, "out_buffer is %s", headers);
+    av_log(NULL, AV_LOG_TRACE, "out_buffer is %s", headers);
     av_opt_set(mms->mms_hd->priv_data, "headers", headers, 0);
 
     err = ffurl_connect(mms->mms_hd, NULL);
@@ -305,12 +312,12 @@ static int mmsh_open_internal(URLContext *h, const char *uri, int flags, int tim
         goto fail;
     }
 
-    av_dlog(NULL, "Connection successfully open\n");
+    av_log(NULL, AV_LOG_TRACE, "Connection successfully open\n");
     return 0;
 fail:
     av_freep(&stream_selection);
     mmsh_close(h);
-    av_dlog(NULL, "Connection failed with error %d\n", err);
+    av_log(NULL, AV_LOG_TRACE, "Connection failed with error %d\n", err);
     return err;
 }
 
@@ -368,23 +375,26 @@ static int mmsh_read(URLContext *h, uint8_t *buf, int size)
 static int64_t mmsh_read_seek(URLContext *h, int stream_index,
                         int64_t timestamp, int flags)
 {
-    MMSHContext *mmsh = h->priv_data;
-    MMSContext *mms   = &mmsh->mms;
+    MMSHContext *mmsh_old = h->priv_data;
+    MMSHContext *mmsh     = av_mallocz(sizeof(*mmsh));
     int ret;
 
-    ret= mmsh_open_internal(h, mmsh->location, 0, FFMAX(timestamp, 0), 0);
+    if (!mmsh)
+        return AVERROR(ENOMEM);
 
+    h->priv_data = mmsh;
+    ret= mmsh_open_internal(h, mmsh_old->location, 0, FFMAX(timestamp, 0), 0);
     if(ret>=0){
-        if (mms->mms_hd)
-            ffurl_close(mms->mms_hd);
-        av_freep(&mms->streams);
-        av_freep(&mms->asf_header);
+        h->priv_data = mmsh_old;
+        mmsh_close(h);
+        h->priv_data = mmsh;
+        av_free(mmsh_old);
+        mmsh->mms.asf_header_read_size = mmsh->mms.asf_header_size;
+    }else {
+        h->priv_data = mmsh_old;
         av_free(mmsh);
-        mmsh = h->priv_data;
-        mms   = &mmsh->mms;
-        mms->asf_header_read_size= mms->asf_header_size;
-    }else
-        h->priv_data= mmsh;
+    }
+
     return ret;
 }
 
@@ -398,7 +408,7 @@ static int64_t mmsh_seek(URLContext *h, int64_t pos, int whence)
     return AVERROR(ENOSYS);
 }
 
-URLProtocol ff_mmsh_protocol = {
+const URLProtocol ff_mmsh_protocol = {
     .name           = "mmsh",
     .url_open       = mmsh_open,
     .url_read       = mmsh_read,
@@ -407,4 +417,5 @@ URLProtocol ff_mmsh_protocol = {
     .url_read_seek  = mmsh_read_seek,
     .priv_data_size = sizeof(MMSHContext),
     .flags          = URL_PROTOCOL_FLAG_NETWORK,
+    .default_whitelist = "http,tcp",
 };

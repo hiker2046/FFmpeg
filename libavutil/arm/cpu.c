@@ -1,22 +1,23 @@
 /*
- * This file is part of Libav.
+ * This file is part of FFmpeg.
  *
- * Libav is free software; you can redistribute it and/or
+ * FFmpeg is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
  * version 2.1 of the License, or (at your option) any later version.
  *
- * Libav is distributed in the hope that it will be useful,
+ * FFmpeg is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
  * Lesser General Public License for more details.
  *
  * You should have received a copy of the GNU Lesser General Public
- * License along with Libav; if not, write to the Free Software
+ * License along with FFmpeg; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
 #include "libavutil/cpu.h"
+#include "libavutil/cpu_internal.h"
 #include "config.h"
 
 #define CORE_FLAG(f) \
@@ -34,6 +35,8 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
+#include "libavutil/avstring.h"
 
 #define AT_HWCAP        16
 
@@ -66,13 +69,46 @@ static int get_hwcap(uint32_t *hwcap)
     return err;
 }
 
+static int get_cpuinfo(uint32_t *hwcap)
+{
+    FILE *f = fopen("/proc/cpuinfo", "r");
+    char buf[200];
+
+    if (!f)
+        return -1;
+
+    *hwcap = 0;
+    while (fgets(buf, sizeof(buf), f)) {
+        if (av_strstart(buf, "Features", NULL)) {
+            if (strstr(buf, " edsp "))
+                *hwcap |= HWCAP_EDSP;
+            if (strstr(buf, " tls "))
+                *hwcap |= HWCAP_TLS;
+            if (strstr(buf, " thumbee "))
+                *hwcap |= HWCAP_THUMBEE;
+            if (strstr(buf, " vfp "))
+                *hwcap |= HWCAP_VFP;
+            if (strstr(buf, " vfpv3 "))
+                *hwcap |= HWCAP_VFPv3;
+            if (strstr(buf, " neon ") || strstr(buf, " asimd "))
+                *hwcap |= HWCAP_NEON;
+            if (strstr(buf, " fp ")) // Listed on 64 bit ARMv8 kernels
+                *hwcap |= HWCAP_VFP | HWCAP_VFPv3;
+            break;
+        }
+    }
+    fclose(f);
+    return 0;
+}
+
 int ff_get_cpu_flags_arm(void)
 {
     int flags = CORE_CPU_FLAGS;
     uint32_t hwcap;
 
     if (get_hwcap(&hwcap) < 0)
-        return flags;
+        if (get_cpuinfo(&hwcap) < 0)
+            return flags;
 
 #define check_cap(cap, flag) do {               \
         if (hwcap & HWCAP_ ## cap)              \
@@ -92,8 +128,18 @@ int ff_get_cpu_flags_arm(void)
        trickle down. */
     if (flags & (AV_CPU_FLAG_VFPV3 | AV_CPU_FLAG_NEON))
         flags |= AV_CPU_FLAG_ARMV6T2;
+    else if (flags & (AV_CPU_FLAG_ARMV6T2 | AV_CPU_FLAG_ARMV6))
+    /* Some functions use the 'setend' instruction which is deprecated on ARMv8
+     * and serializing on some ARMv7 cores. This ensures such functions
+     * are only enabled on ARMv6. */
+        flags |= AV_CPU_FLAG_SETEND;
+
     if (flags & AV_CPU_FLAG_ARMV6T2)
         flags |= AV_CPU_FLAG_ARMV6;
+
+    /* set the virtual VFPv2 vector mode flag */
+    if ((flags & AV_CPU_FLAG_VFP) && !(flags & (AV_CPU_FLAG_VFPV3 | AV_CPU_FLAG_NEON)))
+        flags |= AV_CPU_FLAG_VFP_VM;
 
     return flags;
 }
@@ -107,7 +153,18 @@ int ff_get_cpu_flags_arm(void)
            AV_CPU_FLAG_ARMV6T2 * HAVE_ARMV6T2 |
            AV_CPU_FLAG_VFP     * HAVE_VFP     |
            AV_CPU_FLAG_VFPV3   * HAVE_VFPV3   |
-           AV_CPU_FLAG_NEON    * HAVE_NEON;
+           AV_CPU_FLAG_NEON    * HAVE_NEON    |
+           AV_CPU_FLAG_SETEND  * !(HAVE_NEON | HAVE_VFPV3);
 }
 
 #endif
+
+size_t ff_get_cpu_max_align_arm(void)
+{
+    int flags = av_get_cpu_flags();
+
+    if (flags & AV_CPU_FLAG_NEON)
+        return 16;
+
+    return 8;
+}

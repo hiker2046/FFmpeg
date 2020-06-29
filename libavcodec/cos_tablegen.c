@@ -24,7 +24,9 @@
 #include <string.h>
 #include <math.h>
 
-#define BITS 16
+#include "libavutil/mathematics.h"
+
+#define BITS 17
 #define FLOATFMT "%.18e"
 #define FIXEDFMT "%6d"
 
@@ -37,11 +39,16 @@ static int clip_f15(int v)
 
 static void printval(double val, int fixed)
 {
-    if (fixed)
-        printf(" "FIXEDFMT",", clip_f15(lrint(val * (double)(1<<15))));
-    else
-        printf(" "FLOATFMT",", val);
+    if (fixed) {
+        /* lrint() isn't always available, so round and cast manually. */
+        double new_val = val * (double) (1 << 15);
 
+        new_val = new_val >= 0 ? floor(new_val + 0.5) : ceil(new_val - 0.5);
+
+        printf(" "FIXEDFMT",", clip_f15((long int) new_val));
+    } else {
+        printf(" "FLOATFMT",", val);
+    }
 }
 
 int main(int argc, char *argv[])
@@ -52,7 +59,7 @@ int main(int argc, char *argv[])
     double (*func)(double) = do_sin ? sin : cos;
 
     printf("/* This file was automatically generated. */\n");
-    printf("#define CONFIG_FFT_FLOAT %d\n", !fixed);
+    printf("#define FFT_FLOAT %d\n", !fixed);
     printf("#include \"libavcodec/%s\"\n", do_sin ? "rdft.h" : "fft.h");
     for (i = 4; i <= BITS; i++) {
         int m = 1 << i;

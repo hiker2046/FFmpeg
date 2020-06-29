@@ -1,6 +1,6 @@
 /*
  * Sega FILM Format (CPK) Demuxer
- * Copyright (c) 2003 The ffmpeg Project
+ * Copyright (c) 2003 The FFmpeg project
  *
  * This file is part of FFmpeg.
  *
@@ -38,7 +38,7 @@
 #define CVID_TAG MKBETAG('c', 'v', 'i', 'd')
 #define RAW_TAG  MKBETAG('r', 'a', 'w', ' ')
 
-typedef struct {
+typedef struct film_sample {
   int stream;
   int64_t sample_offset;
   unsigned int sample_size;
@@ -62,18 +62,26 @@ typedef struct FilmDemuxContext {
 
     unsigned int base_clock;
     unsigned int version;
-
-    /* buffer used for interleaving stereo PCM data */
-    unsigned char *stereo_buffer;
-    int stereo_buffer_size;
 } FilmDemuxContext;
 
-static int film_probe(AVProbeData *p)
+static int film_probe(const AVProbeData *p)
 {
     if (AV_RB32(&p->buf[0]) != FILM_TAG)
         return 0;
 
+    if (AV_RB32(&p->buf[16]) != FDSC_TAG)
+        return 0;
+
     return AVPROBE_SCORE_MAX;
+}
+
+static int film_read_close(AVFormatContext *s)
+{
+    FilmDemuxContext *film = s->priv_data;
+
+    av_freep(&film->sample_table);
+
+    return 0;
 }
 
 static int film_read_header(AVFormatContext *s)
@@ -82,13 +90,12 @@ static int film_read_header(AVFormatContext *s)
     AVIOContext *pb = s->pb;
     AVStream *st;
     unsigned char scratch[256];
-    int i;
+    int i, ret;
     unsigned int data_offset;
     unsigned int audio_frame_counter;
+    unsigned int video_frame_counter;
 
     film->sample_table = NULL;
-    film->stereo_buffer = NULL;
-    film->stereo_buffer_size = 0;
 
     /* load the main FILM header */
     if (avio_read(pb, scratch, 16) != 16)
@@ -117,9 +124,9 @@ static int film_read_header(AVFormatContext *s)
             film->audio_type = AV_CODEC_ID_ADPCM_ADX;
         else if (film->audio_channels > 0) {
             if (film->audio_bits == 8)
-                film->audio_type = AV_CODEC_ID_PCM_S8;
+                film->audio_type = AV_CODEC_ID_PCM_S8_PLANAR;
             else if (film->audio_bits == 16)
-                film->audio_type = AV_CODEC_ID_PCM_S16BE;
+                film->audio_type = AV_CODEC_ID_PCM_S16BE_PLANAR;
             else
                 film->audio_type = AV_CODEC_ID_NONE;
         } else
@@ -143,15 +150,15 @@ static int film_read_header(AVFormatContext *s)
         if (!st)
             return AVERROR(ENOMEM);
         film->video_stream_index = st->index;
-        st->codec->codec_type = AVMEDIA_TYPE_VIDEO;
-        st->codec->codec_id = film->video_type;
-        st->codec->codec_tag = 0;  /* no fourcc */
-        st->codec->width = AV_RB32(&scratch[16]);
-        st->codec->height = AV_RB32(&scratch[12]);
+        st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+        st->codecpar->codec_id = film->video_type;
+        st->codecpar->codec_tag = 0;  /* no fourcc */
+        st->codecpar->width = AV_RB32(&scratch[16]);
+        st->codecpar->height = AV_RB32(&scratch[12]);
 
         if (film->video_type == AV_CODEC_ID_RAWVIDEO) {
             if (scratch[20] == 24) {
-                st->codec->pix_fmt = AV_PIX_FMT_RGB24;
+                st->codecpar->format = AV_PIX_FMT_RGB24;
             } else {
                 av_log(s, AV_LOG_ERROR, "raw video is using unhandled %dbpp\n", scratch[20]);
                 return -1;
@@ -164,24 +171,24 @@ static int film_read_header(AVFormatContext *s)
         if (!st)
             return AVERROR(ENOMEM);
         film->audio_stream_index = st->index;
-        st->codec->codec_type = AVMEDIA_TYPE_AUDIO;
-        st->codec->codec_id = film->audio_type;
-        st->codec->codec_tag = 1;
-        st->codec->channels = film->audio_channels;
-        st->codec->sample_rate = film->audio_samplerate;
+        st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
+        st->codecpar->codec_id = film->audio_type;
+        st->codecpar->codec_tag = 1;
+        st->codecpar->channels = film->audio_channels;
+        st->codecpar->sample_rate = film->audio_samplerate;
 
         if (film->audio_type == AV_CODEC_ID_ADPCM_ADX) {
-            st->codec->bits_per_coded_sample = 18 * 8 / 32;
-            st->codec->block_align = st->codec->channels * 18;
+            st->codecpar->bits_per_coded_sample = 18 * 8 / 32;
+            st->codecpar->block_align = st->codecpar->channels * 18;
             st->need_parsing = AVSTREAM_PARSE_FULL;
         } else {
-            st->codec->bits_per_coded_sample = film->audio_bits;
-            st->codec->block_align = st->codec->channels *
-                st->codec->bits_per_coded_sample / 8;
+            st->codecpar->bits_per_coded_sample = film->audio_bits;
+            st->codecpar->block_align = st->codecpar->channels *
+                st->codecpar->bits_per_coded_sample / 8;
         }
 
-        st->codec->bit_rate = st->codec->channels * st->codec->sample_rate *
-            st->codec->bits_per_coded_sample;
+        st->codecpar->bit_rate = st->codecpar->channels * st->codecpar->sample_rate *
+            st->codecpar->bits_per_coded_sample;
     }
 
     /* load the sample table */
@@ -193,28 +200,32 @@ static int film_read_header(AVFormatContext *s)
     film->sample_count = AV_RB32(&scratch[12]);
     if(film->sample_count >= UINT_MAX / sizeof(film_sample))
         return -1;
-    film->sample_table = av_malloc(film->sample_count * sizeof(film_sample));
+    film->sample_table = av_malloc_array(film->sample_count, sizeof(film_sample));
     if (!film->sample_table)
         return AVERROR(ENOMEM);
 
     for (i = 0; i < s->nb_streams; i++) {
         st = s->streams[i];
-        if (st->codec->codec_type == AVMEDIA_TYPE_VIDEO)
+        if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
             avpriv_set_pts_info(st, 33, 1, film->base_clock);
         else
             avpriv_set_pts_info(st, 64, 1, film->audio_samplerate);
     }
 
-    audio_frame_counter = 0;
+    audio_frame_counter = video_frame_counter = 0;
     for (i = 0; i < film->sample_count; i++) {
         /* load the next sample record and transfer it to an internal struct */
         if (avio_read(pb, scratch, 16) != 16) {
-            av_free(film->sample_table);
-            return AVERROR(EIO);
+            ret = AVERROR(EIO);
+            goto fail;
         }
         film->sample_table[i].sample_offset =
             data_offset + AV_RB32(&scratch[0]);
         film->sample_table[i].sample_size = AV_RB32(&scratch[4]);
+        if (film->sample_table[i].sample_size > INT_MAX / 4) {
+            ret = AVERROR_INVALIDDATA;
+            goto fail;
+        }
         if (AV_RB32(&scratch[8]) == 0xFFFFFFFF) {
             film->sample_table[i].stream = film->audio_stream_index;
             film->sample_table[i].pts = audio_frame_counter;
@@ -228,13 +239,29 @@ static int film_read_header(AVFormatContext *s)
         } else {
             film->sample_table[i].stream = film->video_stream_index;
             film->sample_table[i].pts = AV_RB32(&scratch[8]) & 0x7FFFFFFF;
-            film->sample_table[i].keyframe = (scratch[8] & 0x80) ? 0 : 1;
+            film->sample_table[i].keyframe = (scratch[8] & 0x80) ? 0 : AVINDEX_KEYFRAME;
+            video_frame_counter++;
+            if (film->video_type)
+                av_add_index_entry(s->streams[film->video_stream_index],
+                                   film->sample_table[i].sample_offset,
+                                   film->sample_table[i].pts,
+                                   film->sample_table[i].sample_size, 0,
+                                   film->sample_table[i].keyframe);
         }
     }
+
+    if (film->audio_type)
+        s->streams[film->audio_stream_index]->duration = audio_frame_counter;
+
+    if (film->video_type)
+        s->streams[film->video_stream_index]->duration = video_frame_counter;
 
     film->current_sample = 0;
 
     return 0;
+fail:
+    film_read_close(s);
+    return ret;
 }
 
 static int film_read_packet(AVFormatContext *s,
@@ -243,84 +270,62 @@ static int film_read_packet(AVFormatContext *s,
     FilmDemuxContext *film = s->priv_data;
     AVIOContext *pb = s->pb;
     film_sample *sample;
+    film_sample *next_sample = NULL;
+    int next_sample_id;
     int ret = 0;
-    int i;
-    int left, right;
 
     if (film->current_sample >= film->sample_count)
         return AVERROR_EOF;
 
     sample = &film->sample_table[film->current_sample];
 
+    /* Find the next sample from the same stream, assuming there is one;
+     * this is used to calculate the duration below */
+    next_sample_id = film->current_sample + 1;
+    while (next_sample == NULL) {
+        if (next_sample_id >= film->sample_count)
+            break;
+
+        next_sample = &film->sample_table[next_sample_id];
+        if (next_sample->stream != sample->stream) {
+            next_sample = NULL;
+            next_sample_id++;
+        }
+    }
+
     /* position the stream (will probably be there anyway) */
     avio_seek(pb, sample->sample_offset, SEEK_SET);
 
-    /* do a special song and dance when loading FILM Cinepak chunks */
-    if ((sample->stream == film->video_stream_index) &&
-        (film->video_type == AV_CODEC_ID_CINEPAK)) {
-        pkt->pos= avio_tell(pb);
-        if (av_new_packet(pkt, sample->sample_size))
-            return AVERROR(ENOMEM);
-        avio_read(pb, pkt->data, sample->sample_size);
-    } else if ((sample->stream == film->audio_stream_index) &&
-        (film->audio_channels == 2) &&
-        (film->audio_type != AV_CODEC_ID_ADPCM_ADX)) {
-        /* stereo PCM needs to be interleaved */
-
-        if (ffio_limit(pb, sample->sample_size) != sample->sample_size)
-            return AVERROR(EIO);
-        if (av_new_packet(pkt, sample->sample_size))
-            return AVERROR(ENOMEM);
-
-        /* make sure the interleave buffer is large enough */
-        if (sample->sample_size > film->stereo_buffer_size) {
-            av_free(film->stereo_buffer);
-            film->stereo_buffer_size = sample->sample_size;
-            film->stereo_buffer = av_malloc(film->stereo_buffer_size);
-            if (!film->stereo_buffer) {
-                film->stereo_buffer_size = 0;
-                return AVERROR(ENOMEM);
-            }
-        }
-
-        pkt->pos= avio_tell(pb);
-        ret = avio_read(pb, film->stereo_buffer, sample->sample_size);
-        if (ret != sample->sample_size)
-            ret = AVERROR(EIO);
-
-        left = 0;
-        right = sample->sample_size / 2;
-        for (i = 0; i + 1 + 2*(film->audio_bits != 8) < sample->sample_size; ) {
-            if (film->audio_bits == 8) {
-                pkt->data[i++] = film->stereo_buffer[left++];
-                pkt->data[i++] = film->stereo_buffer[right++];
-            } else {
-                pkt->data[i++] = film->stereo_buffer[left++];
-                pkt->data[i++] = film->stereo_buffer[left++];
-                pkt->data[i++] = film->stereo_buffer[right++];
-                pkt->data[i++] = film->stereo_buffer[right++];
-            }
-        }
-    } else {
-        ret= av_get_packet(pb, pkt, sample->sample_size);
-        if (ret != sample->sample_size)
-            ret = AVERROR(EIO);
-    }
+    ret = av_get_packet(pb, pkt, sample->sample_size);
+    if (ret != sample->sample_size)
+        ret = AVERROR(EIO);
 
     pkt->stream_index = sample->stream;
+    pkt->dts = sample->pts;
     pkt->pts = sample->pts;
+    pkt->flags |= sample->keyframe ? AV_PKT_FLAG_KEY : 0;
+    if (next_sample != NULL)
+        pkt->duration = next_sample->pts - sample->pts;
 
     film->current_sample++;
 
     return ret;
 }
 
-static int film_read_close(AVFormatContext *s)
+static int film_read_seek(AVFormatContext *s, int stream_index, int64_t timestamp, int flags)
 {
     FilmDemuxContext *film = s->priv_data;
+    AVStream *st = s->streams[stream_index];
+    int64_t pos;
+    int ret = av_index_search_timestamp(st, timestamp, flags);
+    if (ret < 0)
+        return ret;
 
-    av_free(film->sample_table);
-    av_free(film->stereo_buffer);
+    pos = avio_seek(s->pb, st->index_entries[ret].pos, SEEK_SET);
+    if (pos < 0)
+        return pos;
+
+    film->current_sample = ret;
 
     return 0;
 }
@@ -333,4 +338,5 @@ AVInputFormat ff_segafilm_demuxer = {
     .read_header    = film_read_header,
     .read_packet    = film_read_packet,
     .read_close     = film_read_close,
+    .read_seek      = film_read_seek,
 };

@@ -60,7 +60,7 @@ typedef struct CinDemuxContext {
 } CinDemuxContext;
 
 
-static int cin_probe(AVProbeData *p)
+static int cin_probe(const AVProbeData *p)
 {
     /* header starts with this special marker */
     if (AV_RL32(&p->buf[0]) != 0x55AA0000)
@@ -116,11 +116,11 @@ static int cin_read_header(AVFormatContext *s)
 
     avpriv_set_pts_info(st, 32, 1, 12);
     cin->video_stream_index = st->index;
-    st->codec->codec_type = AVMEDIA_TYPE_VIDEO;
-    st->codec->codec_id = AV_CODEC_ID_DSICINVIDEO;
-    st->codec->codec_tag = 0;  /* no fourcc */
-    st->codec->width = hdr->video_frame_width;
-    st->codec->height = hdr->video_frame_height;
+    st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+    st->codecpar->codec_id = AV_CODEC_ID_DSICINVIDEO;
+    st->codecpar->codec_tag = 0;  /* no fourcc */
+    st->codecpar->width = hdr->video_frame_width;
+    st->codecpar->height = hdr->video_frame_height;
 
     /* initialize the audio decoder stream */
     st = avformat_new_stream(s, NULL);
@@ -129,14 +129,14 @@ static int cin_read_header(AVFormatContext *s)
 
     avpriv_set_pts_info(st, 32, 1, 22050);
     cin->audio_stream_index = st->index;
-    st->codec->codec_type = AVMEDIA_TYPE_AUDIO;
-    st->codec->codec_id = AV_CODEC_ID_DSICINAUDIO;
-    st->codec->codec_tag = 0;  /* no tag */
-    st->codec->channels = 1;
-    st->codec->channel_layout = AV_CH_LAYOUT_MONO;
-    st->codec->sample_rate = 22050;
-    st->codec->bits_per_coded_sample = 8;
-    st->codec->bit_rate = st->codec->sample_rate * st->codec->bits_per_coded_sample * st->codec->channels;
+    st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
+    st->codecpar->codec_id = AV_CODEC_ID_DSICINAUDIO;
+    st->codecpar->codec_tag = 0;  /* no tag */
+    st->codecpar->channels = 1;
+    st->codecpar->channel_layout = AV_CH_LAYOUT_MONO;
+    st->codecpar->sample_rate = 22050;
+    st->codecpar->bits_per_coded_sample = 8;
+    st->codecpar->bit_rate = st->codecpar->sample_rate * st->codecpar->bits_per_coded_sample * st->codecpar->channels;
 
     return 0;
 }
@@ -150,10 +150,12 @@ static int cin_read_frame_header(CinDemuxContext *cin, AVIOContext *pb) {
     hdr->video_frame_size = avio_rl32(pb);
     hdr->audio_frame_size = avio_rl32(pb);
 
-    if (url_feof(pb) || pb->error)
+    if (avio_feof(pb) || pb->error)
         return AVERROR(EIO);
 
     if (avio_rl32(pb) != 0xAA55AA55)
+        return AVERROR_INVALIDDATA;
+    if (hdr->video_frame_size < 0 || hdr->audio_frame_size < 0)
         return AVERROR_INVALIDDATA;
 
     return 0;
@@ -198,7 +200,6 @@ static int cin_read_packet(AVFormatContext *s, AVPacket *pkt)
 
         ret = avio_read(pb, &pkt->data[4], pkt_size);
         if (ret < 0) {
-            av_free_packet(pkt);
             return ret;
         }
         if (ret < pkt_size)

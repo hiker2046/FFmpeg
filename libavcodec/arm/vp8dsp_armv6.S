@@ -5,20 +5,20 @@
  * Copyright (c) 2010 Rob Clark <rob@ti.com>
  * Copyright (c) 2011 Mans Rullgard <mans@mansr.com>
  *
- * This file is part of Libav.
+ * This file is part of FFmpeg.
  *
- * Libav is free software; you can redistribute it and/or
+ * FFmpeg is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
  * version 2.1 of the License, or (at your option) any later version.
  *
- * Libav is distributed in the hope that it will be useful,
+ * FFmpeg is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
  * Lesser General Public License for more details.
  *
  * You should have received a copy of the GNU Lesser General Public
- * License along with Libav; if not, write to the Free Software
+ * License along with FFmpeg; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  *
  * This code was partially ported from libvpx, which uses this license:
@@ -56,7 +56,7 @@
 
 @ idct
 
-@ void vp8_luma_dc_wht(DCTELEM block[4][4][16], DCTELEM dc[16])
+@ void vp8_luma_dc_wht(int16_t block[4][4][16], int16_t dc[16])
 function ff_vp8_luma_dc_wht_armv6, export=1
         push            {r4-r10, lr}
 
@@ -124,14 +124,14 @@ function ff_vp8_luma_dc_wht_armv6, export=1
         sbfx            r1,  r9,  #3,  #13
         sbfx            r10, r4,  #3,  #13
 #else
-        sxth            r8,  r8
-        sxth            r7,  r7
-        sxth            r9,  r9
-        sxth            r4,  r4
-        asr             r8,  #3                 @ block[0][0]
-        asr             r7,  #3                 @ block[0][1]
-        asr             r9,  #3                 @ block[0][2]
-        asr             r4,  #3                 @ block[0][3]
+        sxth            r6,  r8
+        sxth            r12, r7
+        sxth            r1,  r9
+        sxth            r10, r4
+        asr             r6,  #3                 @ block[0][0]
+        asr             r12, #3                 @ block[0][1]
+        asr             r1,  #3                 @ block[0][2]
+        asr             r10, #3                 @ block[0][3]
 #endif
 
         strh            r6,  [r0], #32
@@ -179,7 +179,7 @@ function ff_vp8_luma_dc_wht_armv6, export=1
         pop             {r4-r10, pc}
 endfunc
 
-@ void vp8_luma_dc_wht_dc(DCTELEM block[4][4][16], DCTELEM dc[16])
+@ void vp8_luma_dc_wht_dc(int16_t block[4][4][16], int16_t dc[16])
 function ff_vp8_luma_dc_wht_dc_armv6, export=1
         ldrsh           r2,  [r1]
         mov             r3,  #0
@@ -192,7 +192,7 @@ function ff_vp8_luma_dc_wht_dc_armv6, export=1
         bx              lr
 endfunc
 
-@ void vp8_idct_add(uint8_t *dst, DCTELEM block[16], int stride)
+@ void vp8_idct_add(uint8_t *dst, int16_t block[16], ptrdiff_t stride)
 function ff_vp8_idct_add_armv6, export=1
         push            {r4-r12, lr}
         sub             sp,  sp,  #32
@@ -314,7 +314,7 @@ function ff_vp8_idct_add_armv6, export=1
         pop             {r4-r12, pc}
 endfunc
 
-@ void vp8_idct_dc_add(uint8_t *dst, DCTELEM block[16], int stride)
+@ void vp8_idct_dc_add(uint8_t *dst, int16_t block[16], ptrdiff_t stride)
 function ff_vp8_idct_dc_add_armv6, export=1
         push            {r4-r6, lr}
         add             r6,  r0,  r2,  lsl #1
@@ -355,33 +355,33 @@ function ff_vp8_idct_dc_add_armv6, export=1
         pop             {r4-r6, pc}
 endfunc
 
-@ void vp8_idct_dc_add4uv(uint8_t *dst, DCTELEM block[4][16], int stride)
+@ void vp8_idct_dc_add4uv(uint8_t *dst, int16_t block[4][16], ptrdiff_t stride)
 function ff_vp8_idct_dc_add4uv_armv6, export=1
         push            {r4, lr}
 
-        bl              ff_vp8_idct_dc_add_armv6
+        bl              X(ff_vp8_idct_dc_add_armv6)
         add             r0,  r0,  #4
-        bl              ff_vp8_idct_dc_add_armv6
+        bl              X(ff_vp8_idct_dc_add_armv6)
         add             r0,  r0,  r2,  lsl #2
         sub             r0,  r0,  #4
-        bl              ff_vp8_idct_dc_add_armv6
+        bl              X(ff_vp8_idct_dc_add_armv6)
         add             r0,  r0,  #4
-        bl              ff_vp8_idct_dc_add_armv6
+        bl              X(ff_vp8_idct_dc_add_armv6)
 
         pop             {r4, pc}
 endfunc
 
-@ void vp8_idct_dc_add4y(uint8_t *dst, DCTELEM block[4][16], int stride)
+@ void vp8_idct_dc_add4y(uint8_t *dst, int16_t block[4][16], ptrdiff_t stride)
 function ff_vp8_idct_dc_add4y_armv6, export=1
         push            {r4, lr}
 
-        bl              ff_vp8_idct_dc_add_armv6
+        bl              X(ff_vp8_idct_dc_add_armv6)
         add             r0,  r0,  #4
-        bl              ff_vp8_idct_dc_add_armv6
+        bl              X(ff_vp8_idct_dc_add_armv6)
         add             r0,  r0,  #4
-        bl              ff_vp8_idct_dc_add_armv6
+        bl              X(ff_vp8_idct_dc_add_armv6)
         add             r0,  r0,  #4
-        bl              ff_vp8_idct_dc_add_armv6
+        bl              X(ff_vp8_idct_dc_add_armv6)
 
         pop             {r4, pc}
 endfunc
@@ -455,7 +455,7 @@ endfunc
         eor             r5,  r5,  r2            @ *oq0 = u ^ 0x80
 .endm
 
-@ void vp8_v_loop_filter16_simple(uint8_t *dst, int stride, int flim)
+@ void vp8_v_loop_filter16_simple(uint8_t *dst, ptrdiff_t stride, int flim)
 function ff_vp8_v_loop_filter16_simple_armv6, export=1
         push            {r4-r11, lr}
 
@@ -866,7 +866,7 @@ function ff_vp8_v_loop_filter8uv_armv6, export=1
         b               vp8_v_loop_filter_armv6
 endfunc
 
-@ void vp8_h_loop_filter16_simple(uint8_t *dst, int stride, int flim)
+@ void vp8_h_loop_filter16_simple(uint8_t *dst, ptrdiff_t stride, int flim)
 function ff_vp8_h_loop_filter16_simple_armv6, export=1
         push            {r4-r11, lr}
         orr             r12, r2,  r2,  lsl #16
@@ -1113,8 +1113,8 @@ endfunc
 
 @ MC
 
-@ void put_vp8_pixels16(uint8_t *dst, int dststride, uint8_t *src,
-@                       int srcstride, int h, int mx, int my)
+@ void put_vp8_pixels16(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
+@                       ptrdiff_t srcstride, int h, int mx, int my)
 function ff_put_vp8_pixels16_armv6, export=1
         push            {r4-r11}
         ldr             r12, [sp, #32]          @ h
@@ -1137,8 +1137,8 @@ function ff_put_vp8_pixels16_armv6, export=1
         bx              lr
 endfunc
 
-@ void put_vp8_pixels8(uint8_t *dst, int dststride, uint8_t *src,
-@                      int srcstride, int h, int mx, int my)
+@ void put_vp8_pixels8(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
+@                      ptrdiff_t srcstride, int h, int mx, int my)
 function ff_put_vp8_pixels8_armv6, export=1
         push            {r4-r11}
         ldr             r12, [sp, #32]          @ h
@@ -1161,8 +1161,8 @@ function ff_put_vp8_pixels8_armv6, export=1
         bx              lr
 endfunc
 
-@ void put_vp8_pixels4(uint8_t *dst, int dststride, uint8_t *src,
-@                      int srcstride, int h, int mx, int my)
+@ void put_vp8_pixels4(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
+@                      ptrdiff_t srcstride, int h, int mx, int my)
 function ff_put_vp8_pixels4_armv6, export=1
         ldr             r12, [sp, #0]           @ h
         push            {r4-r6,lr}
@@ -1181,7 +1181,7 @@ function ff_put_vp8_pixels4_armv6, export=1
 endfunc
 
 @ note: worst case sum of all 6-tap filter values * 255 is 0x7f80 so 16 bit
-@ arithmatic can be used to apply filters
+@ arithmetic can be used to apply filters
 const   sixtap_filters_13245600, align=4
         .short     2, 108, -11,  36,  -8, 1, 0, 0
         .short     3,  77, -16,  77, -16, 3, 0, 0
@@ -1204,7 +1204,7 @@ function ff_put_vp8_\name\size\()_\hv\()_armv6, export=1
         mov             r4,  #\size
         stm             r12, {r4, r5}
         orr             r12, r6,  r7
-        b               vp8_put_\name\()_\hv\()_armv6 + 4
+        b               bl_put_\name\()_\hv\()_armv6
 endfunc
 .endm
 
@@ -1226,13 +1226,8 @@ vp8_mc_1                bilin,  8, v
 vp8_mc_1                bilin,  4, h
 vp8_mc_1                bilin,  4, v
 
-/* True relational expressions have the value -1 in the GNU assembler,
-   +1 in Apple's. */
-#ifdef __APPLE__
-#   define TMPSIZE \size * (8 + 8*(\size > 4) + \ytaps - 1)
-#else
-#   define TMPSIZE \size * (8 - 8*(\size > 4) + \ytaps - 1)
-#endif
+@ 4 and 8 pixel wide mc blocks might have height of 8 or 16 lines
+#define TMPSIZE \size * (16 / ((16 / \size + 1) / 2) + \ytaps - 1)
 
 .macro  vp8_mc_hv       name, size, h, v, ytaps
 function ff_put_vp8_\name\size\()_\h\v\()_armv6, export=1
@@ -1300,6 +1295,7 @@ vp8_mc_hv               bilin,  4, h,  v,  2
 
 function vp8_put_epel_h6_armv6
         push            {r1, r4-r11, lr}
+bl_put_epel_h6_armv6:
         sub             r2,  r2,  #2
         movrel          lr,  sixtap_filters_13245600 - 16
         add             lr,  lr,  r12, lsl #3
@@ -1358,6 +1354,7 @@ endfunc
 
 function vp8_put_epel_v6_armv6
         push            {r1, r4-r11, lr}
+bl_put_epel_v6_armv6:
         movrel          lr,  sixtap_filters_13245600 - 16
         add             lr,  lr,  r12, lsl #3
         str             r3,  [sp, #48]
@@ -1437,6 +1434,7 @@ endfunc
 
 function vp8_put_epel_h4_armv6
         push            {r1, r4-r11, lr}
+bl_put_epel_h4_armv6:
         subs            r2,  r2,  #1
         movrel          lr,  fourtap_filters_1324 - 4
         add             lr,  lr,  r12, lsl #2
@@ -1483,6 +1481,7 @@ endfunc
 
 function vp8_put_epel_v4_armv6
         push            {r1, r4-r11, lr}
+bl_put_epel_v4_armv6:
         movrel          lr,  fourtap_filters_1324 - 4
         add             lr,  lr,  r12, lsl #2
         ldm             lr,  {r5, r6}
@@ -1544,6 +1543,7 @@ endfunc
 
 function vp8_put_bilin_h_armv6
         push            {r1, r4-r11, lr}
+bl_put_bilin_h_armv6:
         rsb             r5,  r12, r12, lsl #16
         ldr             r12, [sp, #44]
         sub             r3,  r3,  r4
@@ -1589,6 +1589,7 @@ endfunc
 
 function vp8_put_bilin_v_armv6
         push            {r1, r4-r11, lr}
+bl_put_bilin_v_armv6:
         rsb             r5,  r12, r12, lsl #16
         ldr             r12, [sp, #44]
         add             r5,  r5,  #8

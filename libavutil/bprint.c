@@ -23,8 +23,10 @@
 #include <string.h>
 #include <time.h>
 #include "avassert.h"
+#include "avstring.h"
 #include "bprint.h"
 #include "common.h"
+#include "compat/va_copy.h"
 #include "error.h"
 #include "mem.h"
 
@@ -112,6 +114,29 @@ void av_bprintf(AVBPrint *buf, const char *fmt, ...)
     av_bprint_grow(buf, extra_len);
 }
 
+void av_vbprintf(AVBPrint *buf, const char *fmt, va_list vl_arg)
+{
+    unsigned room;
+    char *dst;
+    int extra_len;
+    va_list vl;
+
+    while (1) {
+        room = av_bprint_room(buf);
+        dst = room ? buf->str + buf->len : NULL;
+        va_copy(vl, vl_arg);
+        extra_len = vsnprintf(dst, room, fmt, vl);
+        va_end(vl);
+        if (extra_len <= 0)
+            return;
+        if (extra_len < room)
+            break;
+        if (av_bprint_alloc(buf, extra_len))
+            break;
+    }
+    av_bprint_grow(buf, extra_len);
+}
+
 void av_bprint_chars(AVBPrint *buf, char c, unsigned n)
 {
     unsigned room, real_n;
@@ -128,6 +153,24 @@ void av_bprint_chars(AVBPrint *buf, char c, unsigned n)
         memset(buf->str + buf->len, c, real_n);
     }
     av_bprint_grow(buf, n);
+}
+
+void av_bprint_append_data(AVBPrint *buf, const char *data, unsigned size)
+{
+    unsigned room, real_n;
+
+    while (1) {
+        room = av_bprint_room(buf);
+        if (size < room)
+            break;
+        if (av_bprint_alloc(buf, size))
+            break;
+    }
+    if (room) {
+        real_n = FFMIN(size, room - 1);
+        memcpy(buf->str + buf->len, data, real_n);
+    }
+    av_bprint_grow(buf, size);
 }
 
 void av_bprint_strftime(AVBPrint *buf, const char *fmt, const struct tm *tm)
@@ -217,78 +260,46 @@ int av_bprint_finalize(AVBPrint *buf, char **ret_str)
     return ret;
 }
 
-#ifdef TEST
+#define WHITESPACES " \n\t\r"
 
-#undef printf
-
-static void bprint_pascal(AVBPrint *b, unsigned size)
+void av_bprint_escape(AVBPrint *dstbuf, const char *src, const char *special_chars,
+                      enum AVEscapeMode mode, int flags)
 {
-    unsigned i, j;
-    unsigned p[42];
+    const char *src0 = src;
 
-    av_assert0(size < FF_ARRAY_ELEMS(p));
+    if (mode == AV_ESCAPE_MODE_AUTO)
+        mode = AV_ESCAPE_MODE_BACKSLASH; /* TODO: implement a heuristic */
 
-    p[0] = 1;
-    av_bprintf(b, "%8d\n", 1);
-    for (i = 1; i <= size; i++) {
-        p[i] = 1;
-        for (j = i - 1; j > 0; j--)
-            p[j] = p[j] + p[j - 1];
-        for (j = 0; j <= i; j++)
-            av_bprintf(b, "%8d", p[j]);
-        av_bprintf(b, "\n");
+    switch (mode) {
+    case AV_ESCAPE_MODE_QUOTE:
+        /* enclose the string between '' */
+        av_bprint_chars(dstbuf, '\'', 1);
+        for (; *src; src++) {
+            if (*src == '\'')
+                av_bprintf(dstbuf, "'\\''");
+            else
+                av_bprint_chars(dstbuf, *src, 1);
+        }
+        av_bprint_chars(dstbuf, '\'', 1);
+        break;
+
+    /* case AV_ESCAPE_MODE_BACKSLASH or unknown mode */
+    default:
+        /* \-escape characters */
+        for (; *src; src++) {
+            int is_first_last       = src == src0 || !*(src+1);
+            int is_ws               = !!strchr(WHITESPACES, *src);
+            int is_strictly_special = special_chars && strchr(special_chars, *src);
+            int is_special          =
+                is_strictly_special || strchr("'\\", *src) ||
+                (is_ws && (flags & AV_ESCAPE_FLAG_WHITESPACE));
+
+            if (is_strictly_special ||
+                (!(flags & AV_ESCAPE_FLAG_STRICT) &&
+                 (is_special || (is_ws && is_first_last))))
+                av_bprint_chars(dstbuf, '\\', 1);
+            av_bprint_chars(dstbuf, *src, 1);
+        }
+        break;
     }
 }
-
-int main(void)
-{
-    AVBPrint b;
-    char buf[256];
-    struct tm testtime = { .tm_year = 100, .tm_mon = 11, .tm_mday = 20 };
-
-    av_bprint_init(&b, 0, -1);
-    bprint_pascal(&b, 5);
-    printf("Short text in unlimited buffer: %u/%u\n", (unsigned)strlen(b.str), b.len);
-    printf("%s\n", b.str);
-    av_bprint_finalize(&b, NULL);
-
-    av_bprint_init(&b, 0, -1);
-    bprint_pascal(&b, 25);
-    printf("Long text in unlimited buffer: %u/%u\n", (unsigned)strlen(b.str), b.len);
-    av_bprint_finalize(&b, NULL);
-
-    av_bprint_init(&b, 0, 2048);
-    bprint_pascal(&b, 25);
-    printf("Long text in limited buffer: %u/%u\n", (unsigned)strlen(b.str), b.len);
-    av_bprint_finalize(&b, NULL);
-
-    av_bprint_init(&b, 0, 1);
-    bprint_pascal(&b, 5);
-    printf("Short text in automatic buffer: %u/%u\n", (unsigned)strlen(b.str), b.len);
-
-    av_bprint_init(&b, 0, 1);
-    bprint_pascal(&b, 25);
-    printf("Long text in automatic buffer: %u/%u\n", (unsigned)strlen(b.str)/8*8, b.len);
-    /* Note that the size of the automatic buffer is arch-dependant. */
-
-    av_bprint_init(&b, 0, 0);
-    bprint_pascal(&b, 25);
-    printf("Long text count only buffer: %u/%u\n", (unsigned)strlen(b.str), b.len);
-
-    av_bprint_init_for_buffer(&b, buf, sizeof(buf));
-    bprint_pascal(&b, 25);
-    printf("Long text count only buffer: %u/%u\n", (unsigned)strlen(buf), b.len);
-
-    av_bprint_init(&b, 0, -1);
-    av_bprint_strftime(&b, "%Y-%m-%d", &testtime);
-    printf("strftime full: %u/%u \"%s\"\n", (unsigned)strlen(buf), b.len, b.str);
-    av_bprint_finalize(&b, NULL);
-
-    av_bprint_init(&b, 0, 8);
-    av_bprint_strftime(&b, "%Y-%m-%d", &testtime);
-    printf("strftime truncated: %u/%u \"%s\"\n", (unsigned)strlen(buf), b.len, b.str);
-
-    return 0;
-}
-
-#endif

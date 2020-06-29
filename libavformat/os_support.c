@@ -21,62 +21,33 @@
  */
 
 /* needed by inet_aton() */
+#define _DEFAULT_SOURCE
 #define _SVID_SOURCE
 
 #include "config.h"
 #include "avformat.h"
 #include "os_support.h"
 
-#if defined(_WIN32) && !defined(__MINGW32CE__)
-#undef open
-#include <fcntl.h>
-#include <io.h>
-#include <windows.h>
-#include <share.h>
-
-int ff_win32_open(const char *filename_utf8, int oflag, int pmode)
-{
-    int fd;
-    int num_chars;
-    wchar_t *filename_w;
-
-    /* convert UTF-8 to wide chars */
-    num_chars = MultiByteToWideChar(CP_UTF8, 0, filename_utf8, -1, NULL, 0);
-    if (num_chars <= 0)
-        return -1;
-    filename_w = av_mallocz(sizeof(wchar_t) * num_chars);
-    MultiByteToWideChar(CP_UTF8, 0, filename_utf8, -1, filename_w, num_chars);
-
-    fd = _wsopen(filename_w, oflag, SH_DENYNO, pmode);
-    av_freep(&filename_w);
-
-    /* filename maybe be in CP_ACP */
-    if (fd == -1 && !(oflag & O_CREAT))
-        return _sopen(filename_utf8, oflag, SH_DENYNO, pmode);
-
-    return fd;
-}
-#endif
-
 #if CONFIG_NETWORK
 #include <fcntl.h>
 #if !HAVE_POLL_H
 #if HAVE_SYS_TIME_H
 #include <sys/time.h>
-#endif
+#endif /* HAVE_SYS_TIME_H */
 #if HAVE_WINSOCK2_H
 #include <winsock2.h>
 #elif HAVE_SYS_SELECT_H
 #include <sys/select.h>
-#endif
-#endif
+#endif /* HAVE_WINSOCK2_H */
+#endif /* !HAVE_POLL_H */
 
 #include "network.h"
 
+#if !HAVE_GETADDRINFO
 #if !HAVE_INET_ATON
 #include <stdlib.h>
 
-int ff_inet_aton(const char *str, struct in_addr *add)
+static int inet_aton(const char *str, struct in_addr *add)
 {
     unsigned int add1 = 0, add2 = 0, add3 = 0, add4 = 0;
 
@@ -90,30 +61,14 @@ int ff_inet_aton(const char *str, struct in_addr *add)
 
     return 1;
 }
-#else
-int ff_inet_aton(const char *str, struct in_addr *add)
-{
-    return inet_aton(str, add);
-}
 #endif /* !HAVE_INET_ATON */
 
-#if !HAVE_GETADDRINFO
 int ff_getaddrinfo(const char *node, const char *service,
                    const struct addrinfo *hints, struct addrinfo **res)
 {
     struct hostent *h = NULL;
     struct addrinfo *ai;
     struct sockaddr_in *sin;
-
-#if HAVE_WINSOCK2_H
-    int (WSAAPI *win_getaddrinfo)(const char *node, const char *service,
-                                  const struct addrinfo *hints,
-                                  struct addrinfo **res);
-    HMODULE ws2mod = GetModuleHandle("ws2_32.dll");
-    win_getaddrinfo = GetProcAddress(ws2mod, "getaddrinfo");
-    if (win_getaddrinfo)
-        return win_getaddrinfo(node, service, hints, res);
-#endif
 
     *res = NULL;
     sin  = av_mallocz(sizeof(struct sockaddr_in));
@@ -122,7 +77,7 @@ int ff_getaddrinfo(const char *node, const char *service,
     sin->sin_family = AF_INET;
 
     if (node) {
-        if (!ff_inet_aton(node, &sin->sin_addr)) {
+        if (!inet_aton(node, &sin->sin_addr)) {
             if (hints && (hints->ai_flags & AI_NUMERICHOST)) {
                 av_free(sin);
                 return EAI_FAIL;
@@ -178,20 +133,9 @@ int ff_getaddrinfo(const char *node, const char *service,
 
 void ff_freeaddrinfo(struct addrinfo *res)
 {
-#if HAVE_WINSOCK2_H
-    void (WSAAPI *win_freeaddrinfo)(struct addrinfo *res);
-    HMODULE ws2mod = GetModuleHandle("ws2_32.dll");
-    win_freeaddrinfo = (void (WSAAPI *)(struct addrinfo *res))
-                       GetProcAddress(ws2mod, "freeaddrinfo");
-    if (win_freeaddrinfo) {
-        win_freeaddrinfo(res);
-        return;
-    }
-#endif
-
-    av_free(res->ai_canonname);
-    av_free(res->ai_addr);
-    av_free(res);
+    av_freep(&res->ai_canonname);
+    av_freep(&res->ai_addr);
+    av_freep(&res);
 }
 
 int ff_getnameinfo(const struct sockaddr *sa, int salen,
@@ -199,16 +143,6 @@ int ff_getnameinfo(const struct sockaddr *sa, int salen,
                    char *serv, int servlen, int flags)
 {
     const struct sockaddr_in *sin = (const struct sockaddr_in *)sa;
-
-#if HAVE_WINSOCK2_H
-    int (WSAAPI *win_getnameinfo)(const struct sockaddr *sa, socklen_t salen,
-                                  char *host, DWORD hostlen,
-                                  char *serv, DWORD servlen, int flags);
-    HMODULE ws2mod = GetModuleHandle("ws2_32.dll");
-    win_getnameinfo = GetProcAddress(ws2mod, "getnameinfo");
-    if (win_getnameinfo)
-        return win_getnameinfo(sa, salen, host, hostlen, serv, servlen, flags);
-#endif
 
     if (sa->sa_family != AF_INET)
         return EAI_FAMILY;
@@ -235,16 +169,9 @@ int ff_getnameinfo(const struct sockaddr *sa, int salen,
     }
 
     if (serv && servlen > 0) {
-        struct servent *ent = NULL;
-#if HAVE_GETSERVBYPORT
         if (!(flags & NI_NUMERICSERV))
-            ent = getservbyport(sin->sin_port, flags & NI_DGRAM ? "udp" : "tcp");
-#endif
-
-        if (ent)
-            snprintf(serv, servlen, "%s", ent->s_name);
-        else
-            snprintf(serv, servlen, "%d", ntohs(sin->sin_port));
+            return EAI_FAIL;
+        snprintf(serv, servlen, "%d", ntohs(sin->sin_port));
     }
 
     return 0;
@@ -269,7 +196,7 @@ const char *ff_gai_strerror(int ecode)
 #if EAI_NODATA != EAI_NONAME
     case EAI_NODATA:
         return "No address associated with hostname";
-#endif
+#endif /* EAI_NODATA != EAI_NONAME */
     case EAI_NONAME:
         return "The name does not resolve for the supplied parameters";
     case EAI_SERVICE:
@@ -292,7 +219,7 @@ int ff_socket_nonblock(int socket, int enable)
         return fcntl(socket, F_SETFL, fcntl(socket, F_GETFL) | O_NONBLOCK);
     else
         return fcntl(socket, F_SETFL, fcntl(socket, F_GETFL) & ~O_NONBLOCK);
-#endif
+#endif /* HAVE_WINSOCK2_H */
 }
 
 #if !HAVE_POLL_H
@@ -310,7 +237,7 @@ int ff_poll(struct pollfd *fds, nfds_t numfds, int timeout)
         errno = EINVAL;
         return -1;
     }
-#endif
+#endif /* HAVE_WINSOCK2_H */
 
     FD_ZERO(&read_set);
     FD_ZERO(&write_set);
@@ -325,7 +252,7 @@ int ff_poll(struct pollfd *fds, nfds_t numfds, int timeout)
             errno = EINVAL;
             return -1;
         }
-#endif
+#endif /* !HAVE_WINSOCK2_H */
 
         if (fds[i].events & POLLIN)
             FD_SET(fds[i].fd, &read_set);
@@ -367,5 +294,6 @@ int ff_poll(struct pollfd *fds, nfds_t numfds, int timeout)
 
     return rc;
 }
-#endif /* HAVE_POLL_H */
+#endif /* !HAVE_POLL_H */
+
 #endif /* CONFIG_NETWORK */

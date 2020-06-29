@@ -54,7 +54,8 @@
 #include "amrwbdec_mips.h"
 
 #if HAVE_INLINE_ASM
-void hb_fir_filter_mips(float *out, const float fir_coef[HB_FIR_SIZE + 1],
+#if !HAVE_MIPS32R6 && !HAVE_MIPS64R6
+void ff_hb_fir_filter_mips(float *out, const float fir_coef[HB_FIR_SIZE + 1],
                           float mem[HB_FIR_SIZE], const float *in)
 {
     int i;
@@ -178,10 +179,11 @@ void hb_fir_filter_mips(float *out, const float fir_coef[HB_FIR_SIZE + 1],
 
             : [output]"=&f"(output)
             : [fir_coef]"r"(fir_coef), [p_data]"r"(p_data)
-            : "$f0", "$f1", "$f2", "$f3", "$f4", "$f5"
+            : "$f0", "$f1", "$f2", "$f3", "$f4", "$f5", "memory"
         );
         out[i] = output;
     }
     memcpy(mem, data + AMRWB_SFR_SIZE_16k, HB_FIR_SIZE * sizeof(float));
 }
+#endif /* !HAVE_MIPS32R6 && !HAVE_MIPS64R6 */
 #endif /* HAVE_INLINE_ASM */

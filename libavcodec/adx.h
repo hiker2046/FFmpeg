@@ -40,7 +40,6 @@ typedef struct ADXChannelState {
 } ADXChannelState;
 
 typedef struct ADXContext {
-    AVFrame frame;
     int channels;
     ADXChannelState prev[2];
     int header_parsed;
@@ -75,7 +74,7 @@ void ff_adx_calculate_coeffs(int cutoff, int sample_rate, int bits, int *coeff);
  * @param[out] coeff        2 LPC coefficients, can be NULL
  * @return data offset or negative error code if header is invalid
  */
-int avpriv_adx_decode_header(AVCodecContext *avctx, const uint8_t *buf,
-                             int bufsize, int *header_size, int *coeff);
+int ff_adx_decode_header(AVCodecContext *avctx, const uint8_t *buf,
+                         int bufsize, int *header_size, int *coeff);
 
 #endif /* AVCODEC_ADX_H */

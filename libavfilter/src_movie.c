@@ -27,28 +27,36 @@
  * @todo support a PTS correction mechanism
  */
 
-/* #define DEBUG */
-
 #include <float.h>
+#include <stdint.h>
+
+#include "libavutil/attributes.h"
 #include "libavutil/avstring.h"
 #include "libavutil/avassert.h"
 #include "libavutil/opt.h"
 #include "libavutil/imgutils.h"
+#include "libavutil/internal.h"
 #include "libavutil/timestamp.h"
+
+#include "libavcodec/avcodec.h"
+
 #include "libavformat/avformat.h"
+
 #include "audio.h"
-#include "avcodec.h"
 #include "avfilter.h"
 #include "formats.h"
 #include "internal.h"
 #include "video.h"
 
-typedef struct {
+typedef struct MovieStream {
     AVStream *st;
+    AVCodecContext *codec_ctx;
     int done;
+    int64_t discontinuity_threshold;
+    int64_t last_pts;
 } MovieStream;
 
-typedef struct {
+typedef struct MovieContext {
     /* common A/V fields */
     const AVClass *class;
     int64_t seek_point;   ///< seekpoint in microseconds
@@ -58,11 +66,12 @@ typedef struct {
     char *stream_specs; /**< user-provided list of streams, separated by + */
     int stream_index; /**< for compatibility */
     int loop_count;
+    int64_t discontinuity_threshold;
+    int64_t ts_offset;
 
     AVFormatContext *format_ctx;
     int eof;
     AVPacket pkt, pkt0;
-    AVFrame *frame;   ///< video frame to store the decoded images in
 
     int max_stream_index; /**< max stream # actually used for output */
     MovieStream *st; /**< array of all streams, one per output */
@@ -70,19 +79,21 @@ typedef struct {
 } MovieContext;
 
 #define OFFSET(x) offsetof(MovieContext, x)
-#define F AV_OPT_FLAG_FILTERING_PARAM
+#define FLAGS AV_OPT_FLAG_FILTERING_PARAM | AV_OPT_FLAG_AUDIO_PARAM | AV_OPT_FLAG_VIDEO_PARAM
 
 static const AVOption movie_options[]= {
-{"format_name",  "set format name",         OFFSET(format_name),  AV_OPT_TYPE_STRING, {.str =  0},  CHAR_MIN, CHAR_MAX, F },
-{"f",            "set format name",         OFFSET(format_name),  AV_OPT_TYPE_STRING, {.str =  0},  CHAR_MIN, CHAR_MAX, F },
-{"streams",      "set streams",             OFFSET(stream_specs), AV_OPT_TYPE_STRING, {.str =  0},  CHAR_MAX, CHAR_MAX, F },
-{"s",            "set streams",             OFFSET(stream_specs), AV_OPT_TYPE_STRING, {.str =  0},  CHAR_MAX, CHAR_MAX, F },
-{"si",           "set stream index",        OFFSET(stream_index), AV_OPT_TYPE_INT,    {.i64 = -1},  -1,       INT_MAX, F },
-{"stream_index", "set stream index",        OFFSET(stream_index), AV_OPT_TYPE_INT,    {.i64 = -1},  -1,       INT_MAX, F },
-{"seek_point",   "set seekpoint (seconds)", OFFSET(seek_point_d), AV_OPT_TYPE_DOUBLE, {.dbl =  0},  0,        (INT64_MAX-1) / 1000000, F },
-{"sp",           "set seekpoint (seconds)", OFFSET(seek_point_d), AV_OPT_TYPE_DOUBLE, {.dbl =  0},  0,        (INT64_MAX-1) / 1000000, F },
-{"loop",         "set loop count",          OFFSET(loop_count),   AV_OPT_TYPE_INT,    {.i64 =  1},  0,        INT_MAX, F },
-{NULL},
+    { "filename",     NULL,                      OFFSET(file_name),    AV_OPT_TYPE_STRING,                                    .flags = FLAGS },
+    { "format_name",  "set format name",         OFFSET(format_name),  AV_OPT_TYPE_STRING,                                    .flags = FLAGS },
+    { "f",            "set format name",         OFFSET(format_name),  AV_OPT_TYPE_STRING,                                    .flags = FLAGS },
+    { "stream_index", "set stream index",        OFFSET(stream_index), AV_OPT_TYPE_INT,    { .i64 = -1 }, -1, INT_MAX,                 FLAGS  },
+    { "si",           "set stream index",        OFFSET(stream_index), AV_OPT_TYPE_INT,    { .i64 = -1 }, -1, INT_MAX,                 FLAGS  },
+    { "seek_point",   "set seekpoint (seconds)", OFFSET(seek_point_d), AV_OPT_TYPE_DOUBLE, { .dbl =  0 },  0, (INT64_MAX-1) / 1000000, FLAGS },
+    { "sp",           "set seekpoint (seconds)", OFFSET(seek_point_d), AV_OPT_TYPE_DOUBLE, { .dbl =  0 },  0, (INT64_MAX-1) / 1000000, FLAGS },
+    { "streams",      "set streams",             OFFSET(stream_specs), AV_OPT_TYPE_STRING, {.str =  0},  0, 0, FLAGS },
+    { "s",            "set streams",             OFFSET(stream_specs), AV_OPT_TYPE_STRING, {.str =  0},  0, 0, FLAGS },
+    { "loop",         "set loop count",          OFFSET(loop_count),   AV_OPT_TYPE_INT,    {.i64 =  1},  0,        INT_MAX, FLAGS },
+    { "discontinuity", "set discontinuity threshold", OFFSET(discontinuity_threshold), AV_OPT_TYPE_DURATION, {.i64 = 0}, 0, INT64_MAX, FLAGS },
+    { NULL },
 };
 
 static int movie_config_output_props(AVFilterLink *outlink);
@@ -91,13 +102,13 @@ static int movie_request_frame(AVFilterLink *outlink);
 static AVStream *find_stream(void *log, AVFormatContext *avf, const char *spec)
 {
     int i, ret, already = 0, stream_id = -1;
-    char type_char, dummy;
+    char type_char[2], dummy;
     AVStream *found = NULL;
     enum AVMediaType type;
 
-    ret = sscanf(spec, "d%[av]%d%c", &type_char, &stream_id, &dummy);
+    ret = sscanf(spec, "d%1[av]%d%c", type_char, &stream_id, &dummy);
     if (ret >= 1 && ret <= 2) {
-        type = type_char == 'v' ? AVMEDIA_TYPE_VIDEO : AVMEDIA_TYPE_AUDIO;
+        type = type_char[0] == 'v' ? AVMEDIA_TYPE_VIDEO : AVMEDIA_TYPE_AUDIO;
         ret = av_find_best_stream(avf, type, stream_id, -1, NULL, 0);
         if (ret < 0) {
             av_log(log, AV_LOG_ERROR, "No %s stream with index '%d' found\n",
@@ -132,29 +143,40 @@ static AVStream *find_stream(void *log, AVFormatContext *avf, const char *spec)
                          "did not match any stream");
         return NULL;
     }
-    if (found->codec->codec_type != AVMEDIA_TYPE_VIDEO &&
-        found->codec->codec_type != AVMEDIA_TYPE_AUDIO) {
+    if (found->codecpar->codec_type != AVMEDIA_TYPE_VIDEO &&
+        found->codecpar->codec_type != AVMEDIA_TYPE_AUDIO) {
         av_log(log, AV_LOG_ERROR, "Stream specifier \"%s\" matched a %s stream,"
                "currently unsupported by libavfilter\n", spec,
-               av_get_media_type_string(found->codec->codec_type));
+               av_get_media_type_string(found->codecpar->codec_type));
         return NULL;
     }
     return found;
 }
 
-static int open_stream(void *log, MovieStream *st)
+static int open_stream(AVFilterContext *ctx, MovieStream *st)
 {
     AVCodec *codec;
     int ret;
 
-    codec = avcodec_find_decoder(st->st->codec->codec_id);
+    codec = avcodec_find_decoder(st->st->codecpar->codec_id);
     if (!codec) {
-        av_log(log, AV_LOG_ERROR, "Failed to find any codec\n");
+        av_log(ctx, AV_LOG_ERROR, "Failed to find any codec\n");
         return AVERROR(EINVAL);
     }
 
-    if ((ret = avcodec_open2(st->st->codec, codec, NULL)) < 0) {
-        av_log(log, AV_LOG_ERROR, "Failed to open codec\n");
+    st->codec_ctx = avcodec_alloc_context3(codec);
+    if (!st->codec_ctx)
+        return AVERROR(ENOMEM);
+
+    ret = avcodec_parameters_to_context(st->codec_ctx, st->st->codecpar);
+    if (ret < 0)
+        return ret;
+
+    st->codec_ctx->refcounted_frames = 1;
+    st->codec_ctx->thread_count = ff_filter_get_nb_threads(ctx);
+
+    if ((ret = avcodec_open2(st->codec_ctx, codec, NULL)) < 0) {
+        av_log(ctx, AV_LOG_ERROR, "Failed to open codec\n");
         return ret;
     }
 
@@ -163,52 +185,41 @@ static int open_stream(void *log, MovieStream *st)
 
 static int guess_channel_layout(MovieStream *st, int st_index, void *log_ctx)
 {
-    AVCodecContext *dec_ctx = st->st->codec;
+    AVCodecParameters *dec_par = st->st->codecpar;
     char buf[256];
-    int64_t chl = av_get_default_channel_layout(dec_ctx->channels);
+    int64_t chl = av_get_default_channel_layout(dec_par->channels);
 
     if (!chl) {
         av_log(log_ctx, AV_LOG_ERROR,
                "Channel layout is not set in stream %d, and could not "
                "be guessed from the number of channels (%d)\n",
-               st_index, dec_ctx->channels);
+               st_index, dec_par->channels);
         return AVERROR(EINVAL);
     }
 
-    av_get_channel_layout_string(buf, sizeof(buf), dec_ctx->channels, chl);
+    av_get_channel_layout_string(buf, sizeof(buf), dec_par->channels, chl);
     av_log(log_ctx, AV_LOG_WARNING,
            "Channel layout is not set in output stream %d, "
            "guessed channel layout is '%s'\n",
            st_index, buf);
-    dec_ctx->channel_layout = chl;
+    dec_par->channel_layout = chl;
     return 0;
 }
 
-static av_cold int movie_common_init(AVFilterContext *ctx, const char *args, const AVClass *class)
+static av_cold int movie_common_init(AVFilterContext *ctx)
 {
     MovieContext *movie = ctx->priv;
     AVInputFormat *iformat = NULL;
     int64_t timestamp;
-    int nb_streams, ret, i;
+    int nb_streams = 1, ret, i;
     char default_streams[16], *stream_specs, *spec, *cursor;
     char name[16];
     AVStream *st;
 
-    movie->class = class;
-    av_opt_set_defaults(movie);
-
-    if (args) {
-        movie->file_name = av_get_token(&args, ":");
-        if (!movie->file_name)
-            return AVERROR(ENOMEM);
-    }
-    if (!args || !*movie->file_name) {
+    if (!movie->file_name) {
         av_log(ctx, AV_LOG_ERROR, "No filename provided!\n");
         return AVERROR(EINVAL);
     }
-
-    if (*args++ == ':' && (ret = av_set_options_string(movie, args, "=", ":")) < 0)
-        return ret;
 
     movie->seek_point = movie->seek_point_d * 1000000 + 0.5;
 
@@ -219,7 +230,7 @@ static av_cold int movie_common_init(AVFilterContext *ctx, const char *args, con
                  movie->stream_index);
         stream_specs = default_streams;
     }
-    for (cursor = stream_specs, nb_streams = 1; *cursor; cursor++)
+    for (cursor = stream_specs; *cursor; cursor++)
         if (*cursor == '+')
             nb_streams++;
 
@@ -228,8 +239,6 @@ static av_cold int movie_common_init(AVFilterContext *ctx, const char *args, con
                "Loop with several streams is currently unsupported\n");
         return AVERROR_PATCHWELCOME;
     }
-
-    av_register_all();
 
     // Try to find the movie format (container)
     iformat = movie->format_name ? av_find_input_format(movie->format_name) : NULL;
@@ -248,7 +257,7 @@ static av_cold int movie_common_init(AVFilterContext *ctx, const char *args, con
         timestamp = movie->seek_point;
         // add the stream start time, should it exist
         if (movie->format_ctx->start_time != AV_NOPTS_VALUE) {
-            if (timestamp > INT64_MAX - movie->format_ctx->start_time) {
+            if (timestamp > 0 && movie->format_ctx->start_time > INT64_MAX - timestamp) {
                 av_log(ctx, AV_LOG_ERROR,
                        "%s: seek value overflow with start_time:%"PRId64" seek_point:%"PRId64"\n",
                        movie->file_name, movie->format_ctx->start_time, movie->seek_point);
@@ -281,6 +290,8 @@ static av_cold int movie_common_init(AVFilterContext *ctx, const char *args, con
         st->discard = AVDISCARD_DEFAULT;
         movie->st[i].st = st;
         movie->max_stream_index = FFMAX(movie->max_stream_index, st->index);
+        movie->st[i].discontinuity_threshold =
+            av_rescale_q(movie->discontinuity_threshold, AV_TIME_BASE_Q, st->time_base);
     }
     if (av_strtok(NULL, "+", &cursor))
         return AVERROR_BUG;
@@ -291,31 +302,29 @@ static av_cold int movie_common_init(AVFilterContext *ctx, const char *args, con
         return AVERROR(ENOMEM);
     for (i = 0; i <= movie->max_stream_index; i++)
         movie->out_index[i] = -1;
-    for (i = 0; i < nb_streams; i++)
-        movie->out_index[movie->st[i].st->index] = i;
-
     for (i = 0; i < nb_streams; i++) {
         AVFilterPad pad = { 0 };
+        movie->out_index[movie->st[i].st->index] = i;
         snprintf(name, sizeof(name), "out%d", i);
-        pad.type          = movie->st[i].st->codec->codec_type;
+        pad.type          = movie->st[i].st->codecpar->codec_type;
         pad.name          = av_strdup(name);
+        if (!pad.name)
+            return AVERROR(ENOMEM);
         pad.config_props  = movie_config_output_props;
         pad.request_frame = movie_request_frame;
-        ff_insert_outpad(ctx, i, &pad);
-        ret = open_stream(ctx, &movie->st[i]);
-        if (ret < 0)
+        if ((ret = ff_insert_outpad(ctx, i, &pad)) < 0) {
+            av_freep(&pad.name);
             return ret;
-        if ( movie->st[i].st->codec->codec->type == AVMEDIA_TYPE_AUDIO &&
-            !movie->st[i].st->codec->channel_layout) {
+        }
+        if ( movie->st[i].st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO &&
+            !movie->st[i].st->codecpar->channel_layout) {
             ret = guess_channel_layout(&movie->st[i], i, ctx);
             if (ret < 0)
                 return ret;
         }
-    }
-
-    if (!(movie->frame = avcodec_alloc_frame()) ) {
-        av_log(log, AV_LOG_ERROR, "Failed to alloc frame\n");
-        return AVERROR(ENOMEM);
+        ret = open_stream(ctx, &movie->st[i]);
+        if (ret < 0)
+            return ret;
     }
 
     av_log(ctx, AV_LOG_VERBOSE, "seek_point:%"PRIi64" format_name:%s file_name:%s stream_index:%d\n",
@@ -333,13 +342,10 @@ static av_cold void movie_uninit(AVFilterContext *ctx)
     for (i = 0; i < ctx->nb_outputs; i++) {
         av_freep(&ctx->output_pads[i].name);
         if (movie->st[i].st)
-            avcodec_close(movie->st[i].st->codec);
+            avcodec_free_context(&movie->st[i].codec_ctx);
     }
-    av_opt_free(movie);
-    av_freep(&movie->file_name);
     av_freep(&movie->st);
     av_freep(&movie->out_index);
-    avcodec_free_frame(&movie->frame);
     if (movie->format_ctx)
         avformat_close_input(&movie->format_ctx);
 }
@@ -349,26 +355,30 @@ static int movie_query_formats(AVFilterContext *ctx)
     MovieContext *movie = ctx->priv;
     int list[] = { 0, -1 };
     int64_t list64[] = { 0, -1 };
-    int i;
+    int i, ret;
 
     for (i = 0; i < ctx->nb_outputs; i++) {
         MovieStream *st = &movie->st[i];
-        AVCodecContext *c = st->st->codec;
+        AVCodecParameters *c = st->st->codecpar;
         AVFilterLink *outlink = ctx->outputs[i];
 
         switch (c->codec_type) {
         case AVMEDIA_TYPE_VIDEO:
-            list[0] = c->pix_fmt;
-            ff_formats_ref(ff_make_format_list(list), &outlink->in_formats);
+            list[0] = c->format;
+            if ((ret = ff_formats_ref(ff_make_format_list(list), &outlink->in_formats)) < 0)
+                return ret;
             break;
         case AVMEDIA_TYPE_AUDIO:
-            list[0] = c->sample_fmt;
-            ff_formats_ref(ff_make_format_list(list), &outlink->in_formats);
+            list[0] = c->format;
+            if ((ret = ff_formats_ref(ff_make_format_list(list), &outlink->in_formats)) < 0)
+                return ret;
             list[0] = c->sample_rate;
-            ff_formats_ref(ff_make_format_list(list), &outlink->in_samplerates);
+            if ((ret = ff_formats_ref(ff_make_format_list(list), &outlink->in_samplerates)) < 0)
+                return ret;
             list64[0] = c->channel_layout;
-            ff_channel_layouts_ref(avfilter_make_format64_list(list64),
-                                   &outlink->in_channel_layouts);
+            if ((ret = ff_channel_layouts_ref(avfilter_make_format64_list(list64),
+                                   &outlink->in_channel_layouts)) < 0)
+                return ret;
             break;
         }
     }
@@ -382,7 +392,7 @@ static int movie_config_output_props(AVFilterLink *outlink)
     MovieContext *movie  = ctx->priv;
     unsigned out_id = FF_OUTLINK_IDX(outlink);
     MovieStream *st = &movie->st[out_id];
-    AVCodecContext *c = st->st->codec;
+    AVCodecParameters *c = st->st->codecpar;
 
     outlink->time_base = st->st->time_base;
 
@@ -399,54 +409,31 @@ static int movie_config_output_props(AVFilterLink *outlink)
     return 0;
 }
 
-static AVFilterBufferRef *frame_to_buf(enum AVMediaType type, AVFrame *frame,
-                                       AVFilterLink *outlink)
+static char *describe_frame_to_str(char *dst, size_t dst_size,
+                                   AVFrame *frame, enum AVMediaType frame_type,
+                                   AVFilterLink *link)
 {
-    AVFilterBufferRef *buf, *copy;
-
-    buf = avfilter_get_buffer_ref_from_frame(type, frame,
-                                             AV_PERM_WRITE |
-                                             AV_PERM_PRESERVE |
-                                             AV_PERM_REUSE2);
-    if (!buf)
-        return NULL;
-    buf->pts = av_frame_get_best_effort_timestamp(frame);
-    copy = ff_copy_buffer_ref(outlink, buf);
-    if (!copy)
-        return NULL;
-    buf->buf->data[0] = NULL; /* it belongs to the frame */
-    avfilter_unref_buffer(buf);
-    return copy;
-}
-
-static char *describe_bufref_to_str(char *dst, size_t dst_size,
-                                    AVFilterBufferRef *buf,
-                                    AVFilterLink *link)
-{
-    switch (buf->type) {
+    switch (frame_type) {
     case AVMEDIA_TYPE_VIDEO:
         snprintf(dst, dst_size,
-                 "video pts:%s time:%s pos:%"PRId64" size:%dx%d aspect:%d/%d",
-                 av_ts2str(buf->pts), av_ts2timestr(buf->pts, &link->time_base),
-                 buf->pos, buf->video->w, buf->video->h,
-                 buf->video->sample_aspect_ratio.num,
-                 buf->video->sample_aspect_ratio.den);
+                 "video pts:%s time:%s size:%dx%d aspect:%d/%d",
+                 av_ts2str(frame->pts), av_ts2timestr(frame->pts, &link->time_base),
+                 frame->width, frame->height,
+                 frame->sample_aspect_ratio.num,
+                 frame->sample_aspect_ratio.den);
                  break;
     case AVMEDIA_TYPE_AUDIO:
         snprintf(dst, dst_size,
-                 "audio pts:%s time:%s pos:%"PRId64" samples:%d",
-                 av_ts2str(buf->pts), av_ts2timestr(buf->pts, &link->time_base),
-                 buf->pos, buf->audio->nb_samples);
+                 "audio pts:%s time:%s samples:%d",
+                 av_ts2str(frame->pts), av_ts2timestr(frame->pts, &link->time_base),
+                 frame->nb_samples);
                  break;
     default:
-        snprintf(dst, dst_size, "%s BUG", av_get_media_type_string(buf->type));
+        snprintf(dst, dst_size, "%s BUG", av_get_media_type_string(frame_type));
         break;
     }
     return dst;
 }
-
-#define describe_bufref(buf, link) \
-    describe_bufref_to_str((char[1024]){0}, 1024, buf, link)
 
 static int rewind_file(AVFilterContext *ctx)
 {
@@ -464,7 +451,7 @@ static int rewind_file(AVFilterContext *ctx)
     }
 
     for (i = 0; i < ctx->nb_outputs; i++) {
-        avcodec_flush_buffers(movie->st[i].st->codec);
+        avcodec_flush_buffers(movie->st[i].codec_ctx);
         movie->st[i].done = 0;
     }
     movie->eof = 0;
@@ -486,10 +473,11 @@ static int movie_push_frame(AVFilterContext *ctx, unsigned out_id)
 {
     MovieContext *movie = ctx->priv;
     AVPacket *pkt = &movie->pkt;
+    enum AVMediaType frame_type;
     MovieStream *st;
     int ret, got_frame = 0, pkt_out_id;
     AVFilterLink *outlink;
-    AVFilterBufferRef *buf;
+    AVFrame *frame;
 
     if (!pkt->size) {
         if (movie->eof) {
@@ -524,7 +512,7 @@ static int movie_push_frame(AVFilterContext *ctx, unsigned out_id)
     pkt_out_id = pkt->stream_index > movie->max_stream_index ? -1 :
                  movie->out_index[pkt->stream_index];
     if (pkt_out_id < 0) {
-        av_free_packet(&movie->pkt0);
+        av_packet_unref(&movie->pkt0);
         pkt->size = 0; /* ready for next run */
         pkt->data = NULL;
         return 0;
@@ -532,12 +520,17 @@ static int movie_push_frame(AVFilterContext *ctx, unsigned out_id)
     st = &movie->st[pkt_out_id];
     outlink = ctx->outputs[pkt_out_id];
 
-    switch (st->st->codec->codec_type) {
+    frame = av_frame_alloc();
+    if (!frame)
+        return AVERROR(ENOMEM);
+
+    frame_type = st->st->codecpar->codec_type;
+    switch (frame_type) {
     case AVMEDIA_TYPE_VIDEO:
-        ret = avcodec_decode_video2(st->st->codec, movie->frame, &got_frame, pkt);
+        ret = avcodec_decode_video2(st->codec_ctx, frame, &got_frame, pkt);
         break;
     case AVMEDIA_TYPE_AUDIO:
-        ret = avcodec_decode_audio4(st->st->codec, movie->frame, &got_frame, pkt);
+        ret = avcodec_decode_audio4(st->codec_ctx, frame, &got_frame, pkt);
         break;
     default:
         ret = AVERROR(ENOSYS);
@@ -545,39 +538,62 @@ static int movie_push_frame(AVFilterContext *ctx, unsigned out_id)
     }
     if (ret < 0) {
         av_log(ctx, AV_LOG_WARNING, "Decode error: %s\n", av_err2str(ret));
+        av_frame_free(&frame);
+        av_packet_unref(&movie->pkt0);
+        movie->pkt.size = 0;
+        movie->pkt.data = NULL;
         return 0;
     }
-    if (!ret)
+    if (!ret || st->st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
         ret = pkt->size;
 
     pkt->data += ret;
     pkt->size -= ret;
     if (pkt->size <= 0) {
-        av_free_packet(&movie->pkt0);
+        av_packet_unref(&movie->pkt0);
         pkt->size = 0; /* ready for next run */
         pkt->data = NULL;
     }
     if (!got_frame) {
         if (!ret)
             st->done = 1;
+        av_frame_free(&frame);
         return 0;
     }
 
-    buf = frame_to_buf(st->st->codec->codec_type, movie->frame, outlink);
-    if (!buf)
-        return AVERROR(ENOMEM);
-    av_dlog(ctx, "movie_push_frame(): file:'%s' %s\n", movie->file_name,
-            describe_bufref(buf, outlink));
-    switch (st->st->codec->codec_type) {
-    case AVMEDIA_TYPE_VIDEO:
-        if (!movie->frame->sample_aspect_ratio.num)
-            buf->video->sample_aspect_ratio = st->st->sample_aspect_ratio;
-        /* Fall through */
-    case AVMEDIA_TYPE_AUDIO:
-        ff_filter_frame(outlink, buf);
-        break;
+    frame->pts = frame->best_effort_timestamp;
+    if (frame->pts != AV_NOPTS_VALUE) {
+        if (movie->ts_offset)
+            frame->pts += av_rescale_q_rnd(movie->ts_offset, AV_TIME_BASE_Q, outlink->time_base, AV_ROUND_UP);
+        if (st->discontinuity_threshold) {
+            if (st->last_pts != AV_NOPTS_VALUE) {
+                int64_t diff = frame->pts - st->last_pts;
+                if (diff < 0 || diff > st->discontinuity_threshold) {
+                    av_log(ctx, AV_LOG_VERBOSE, "Discontinuity in stream:%d diff:%"PRId64"\n", pkt_out_id, diff);
+                    movie->ts_offset += av_rescale_q_rnd(-diff, outlink->time_base, AV_TIME_BASE_Q, AV_ROUND_UP);
+                    frame->pts -= diff;
+                }
+            }
+        }
+        st->last_pts = frame->pts;
     }
+    ff_dlog(ctx, "movie_push_frame(): file:'%s' %s\n", movie->file_name,
+            describe_frame_to_str((char[1024]){0}, 1024, frame, frame_type, outlink));
 
+    if (st->st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+        if (frame->format != outlink->format) {
+            av_log(ctx, AV_LOG_ERROR, "Format changed %s -> %s, discarding frame\n",
+                av_get_pix_fmt_name(outlink->format),
+                av_get_pix_fmt_name(frame->format)
+                );
+            av_frame_free(&frame);
+            return 0;
+        }
+    }
+    ret = ff_filter_frame(outlink, frame);
+
+    if (ret < 0)
+        return ret;
     return pkt_out_id == out_id;
 }
 
@@ -594,26 +610,66 @@ static int movie_request_frame(AVFilterLink *outlink)
     }
 }
 
+static int process_command(AVFilterContext *ctx, const char *cmd, const char *args,
+                           char *res, int res_len, int flags)
+{
+    MovieContext *movie = ctx->priv;
+    int ret = AVERROR(ENOSYS);
+
+    if (!strcmp(cmd, "seek")) {
+        int idx, flags, i;
+        int64_t ts;
+        char tail[2];
+
+        if (sscanf(args, "%i|%"SCNi64"|%i %1s", &idx, &ts, &flags, tail) != 3)
+            return AVERROR(EINVAL);
+
+        ret = av_seek_frame(movie->format_ctx, idx, ts, flags);
+        if (ret < 0)
+            return ret;
+
+        for (i = 0; i < ctx->nb_outputs; i++) {
+            avcodec_flush_buffers(movie->st[i].codec_ctx);
+            movie->st[i].done = 0;
+        }
+        return ret;
+    } else if (!strcmp(cmd, "get_duration")) {
+        int print_len;
+        char tail[2];
+
+        if (!res || res_len <= 0)
+            return AVERROR(EINVAL);
+
+        if (args && sscanf(args, "%1s", tail) == 1)
+            return AVERROR(EINVAL);
+
+        print_len = snprintf(res, res_len, "%"PRId64, movie->format_ctx->duration);
+        if (print_len < 0 || print_len >= res_len)
+            return AVERROR(EINVAL);
+
+        return 0;
+    }
+
+    return ret;
+}
+
 #if CONFIG_MOVIE_FILTER
 
 AVFILTER_DEFINE_CLASS(movie);
 
-static av_cold int movie_init(AVFilterContext *ctx, const char *args)
-{
-    return movie_common_init(ctx, args, &movie_class);
-}
-
-AVFilter avfilter_avsrc_movie = {
+AVFilter ff_avsrc_movie = {
     .name          = "movie",
     .description   = NULL_IF_CONFIG_SMALL("Read from a movie source."),
     .priv_size     = sizeof(MovieContext),
-    .init          = movie_init,
+    .priv_class    = &movie_class,
+    .init          = movie_common_init,
     .uninit        = movie_uninit,
     .query_formats = movie_query_formats,
 
     .inputs    = NULL,
     .outputs   = NULL,
-    .priv_class = &movie_class,
+    .flags     = AVFILTER_FLAG_DYNAMIC_OUTPUTS,
+    .process_command = process_command
 };
 
 #endif  /* CONFIG_MOVIE_FILTER */
@@ -623,22 +679,19 @@ AVFilter avfilter_avsrc_movie = {
 #define amovie_options movie_options
 AVFILTER_DEFINE_CLASS(amovie);
 
-static av_cold int amovie_init(AVFilterContext *ctx, const char *args)
-{
-    return movie_common_init(ctx, args, &amovie_class);
-}
-
-AVFilter avfilter_avsrc_amovie = {
+AVFilter ff_avsrc_amovie = {
     .name          = "amovie",
     .description   = NULL_IF_CONFIG_SMALL("Read audio from a movie source."),
     .priv_size     = sizeof(MovieContext),
-    .init          = amovie_init,
+    .init          = movie_common_init,
     .uninit        = movie_uninit,
     .query_formats = movie_query_formats,
 
     .inputs     = NULL,
     .outputs    = NULL,
     .priv_class = &amovie_class,
+    .flags      = AVFILTER_FLAG_DYNAMIC_OUTPUTS,
+    .process_command = process_command,
 };
 
 #endif /* CONFIG_AMOVIE_FILTER */

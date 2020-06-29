@@ -20,17 +20,17 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "libavutil/avassert.h"
+#include <inttypes.h>
+
 #include "avcodec.h"
 #include "bytestream.h"
 #include "internal.h"
 
+#include "libavutil/avassert.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/mem.h"
 
 typedef struct DfaContext {
-    AVFrame pic;
-
     uint32_t pal[256];
     uint8_t *frame_buf;
 } DfaContext;
@@ -41,7 +41,7 @@ static av_cold int dfa_decode_init(AVCodecContext *avctx)
 
     avctx->pix_fmt = AV_PIX_FMT_PAL8;
 
-    if (!avctx->width || !avctx->height)
+    if (!avctx->width || !avctx->height || FFMAX(avctx->width, avctx->height) >= (1<<16))
         return AVERROR_INVALIDDATA;
 
     av_assert0(av_image_check_size(avctx->width, avctx->height, 0, avctx) >= 0);
@@ -67,7 +67,8 @@ static int decode_tsw1(GetByteContext *gb, uint8_t *frame, int width, int height
     const uint8_t *frame_start = frame;
     const uint8_t *frame_end   = frame + width * height;
     int mask = 0x10000, bitbuf = 0;
-    int v, count, segments;
+    int v, count;
+    unsigned segments;
     unsigned offset;
 
     segments = bytestream2_get_le32(gb);
@@ -148,6 +149,8 @@ static int decode_dds1(GetByteContext *gb, uint8_t *frame, int width, int height
     int mask = 0x10000, bitbuf = 0;
     int i, v, offset, count, segments;
 
+    if ((width | height) & 1)
+        return AVERROR_INVALIDDATA;
     segments = bytestream2_get_le16(gb);
     while (segments--) {
         if (bytestream2_get_bytes_left(gb) < 2)
@@ -175,7 +178,7 @@ static int decode_dds1(GetByteContext *gb, uint8_t *frame, int width, int height
                 return AVERROR_INVALIDDATA;
             frame += v;
         } else {
-            if (frame_end - frame < width + 3)
+            if (width < 4 || frame_end - frame < width + 4)
                 return AVERROR_INVALIDDATA;
             frame[0] = frame[1] =
             frame[width] = frame[width + 1] =  bytestream2_get_byte(gb);
@@ -249,20 +252,23 @@ static int decode_wdlt(GetByteContext *gb, uint8_t *frame, int width, int height
         segments = bytestream2_get_le16u(gb);
         while ((segments & 0xC000) == 0xC000) {
             unsigned skip_lines = -(int16_t)segments;
-            unsigned delta = -((int16_t)segments * width);
+            int64_t delta = -((int16_t)segments * (int64_t)width);
             if (frame_end - frame <= delta || y + lines + skip_lines > height)
                 return AVERROR_INVALIDDATA;
             frame    += delta;
             y        += skip_lines;
             segments = bytestream2_get_le16(gb);
         }
+
         if (frame_end <= frame)
-            return -1;
+            return AVERROR_INVALIDDATA;
         if (segments & 0x8000) {
             frame[width - 1] = segments & 0xFF;
             segments = bytestream2_get_le16(gb);
         }
         line_ptr = frame;
+        if (frame_end - frame < width)
+            return AVERROR_INVALIDDATA;
         frame += width;
         y++;
         while (segments--) {
@@ -290,9 +296,26 @@ static int decode_wdlt(GetByteContext *gb, uint8_t *frame, int width, int height
     return 0;
 }
 
-static int decode_unk6(GetByteContext *gb, uint8_t *frame, int width, int height)
+static int decode_tdlt(GetByteContext *gb, uint8_t *frame, int width, int height)
 {
-    return AVERROR_PATCHWELCOME;
+    const uint8_t *frame_end = frame + width * height;
+    uint32_t segments = bytestream2_get_le32(gb);
+    int skip, copy;
+
+    while (segments--) {
+        if (bytestream2_get_bytes_left(gb) < 2)
+            return AVERROR_INVALIDDATA;
+        copy = bytestream2_get_byteu(gb) * 2;
+        skip = bytestream2_get_byteu(gb) * 2;
+        if (frame_end - frame < copy + skip ||
+            bytestream2_get_bytes_left(gb) < copy)
+            return AVERROR_INVALIDDATA;
+        frame += skip;
+        bytestream2_get_buffer(gb, frame, copy);
+        frame += copy;
+    }
+
+    return 0;
 }
 
 static int decode_blck(GetByteContext *gb, uint8_t *frame, int width, int height)
@@ -306,17 +329,18 @@ typedef int (*chunk_decoder)(GetByteContext *gb, uint8_t *frame, int width, int 
 
 static const chunk_decoder decoder[8] = {
     decode_copy, decode_tsw1, decode_bdlt, decode_wdlt,
-    decode_unk6, decode_dsw1, decode_blck, decode_dds1,
+    decode_tdlt, decode_dsw1, decode_blck, decode_dds1,
 };
 
-static const char* chunk_name[8] = {
-    "COPY", "TSW1", "BDLT", "WDLT", "????", "DSW1", "BLCK", "DDS1"
+static const char chunk_name[8][5] = {
+    "COPY", "TSW1", "BDLT", "WDLT", "TDLT", "DSW1", "BLCK", "DDS1"
 };
 
 static int dfa_decode_frame(AVCodecContext *avctx,
                             void *data, int *got_frame,
                             AVPacket *avpkt)
 {
+    AVFrame *frame = data;
     DfaContext *s = avctx->priv_data;
     GetByteContext gb;
     const uint8_t *buf = avpkt->data;
@@ -324,17 +348,15 @@ static int dfa_decode_frame(AVCodecContext *avctx,
     uint8_t *dst;
     int ret;
     int i, pal_elems;
+    int version = avctx->extradata_size==2 ? AV_RL16(avctx->extradata) : 0;
 
-    if (s->pic.data[0])
-        avctx->release_buffer(avctx, &s->pic);
-
-    if ((ret = ff_get_buffer(avctx, &s->pic))) {
-        av_log(avctx, AV_LOG_ERROR, "get_buffer() failed\n");
+    if ((ret = ff_get_buffer(avctx, frame, 0)) < 0)
         return ret;
-    }
 
     bytestream2_init(&gb, avpkt->data, avpkt->size);
     while (bytestream2_get_bytes_left(&gb) > 0) {
+        if (bytestream2_get_bytes_left(&gb) < 12)
+            return AVERROR_INVALIDDATA;
         bytestream2_skip(&gb, 4);
         chunk_size = bytestream2_get_le32(&gb);
         chunk_type = bytestream2_get_le32(&gb);
@@ -346,7 +368,7 @@ static int dfa_decode_frame(AVCodecContext *avctx,
                 s->pal[i] = bytestream2_get_be24(&gb) << 2;
                 s->pal[i] |= 0xFFU << 24 | (s->pal[i] >> 6) & 0x30303;
             }
-            s->pic.palette_has_changed = 1;
+            frame->palette_has_changed = 1;
         } else if (chunk_type <= 9) {
             if (decoder[chunk_type - 2](&gb, s->frame_buf, avctx->width, avctx->height)) {
                 av_log(avctx, AV_LOG_ERROR, "Error decoding %s chunk\n",
@@ -354,23 +376,31 @@ static int dfa_decode_frame(AVCodecContext *avctx,
                 return AVERROR_INVALIDDATA;
             }
         } else {
-            av_log(avctx, AV_LOG_WARNING, "Ignoring unknown chunk type %d\n",
+            av_log(avctx, AV_LOG_WARNING,
+                   "Ignoring unknown chunk type %"PRIu32"\n",
                    chunk_type);
         }
         buf += chunk_size;
     }
 
     buf = s->frame_buf;
-    dst = s->pic.data[0];
+    dst = frame->data[0];
     for (i = 0; i < avctx->height; i++) {
-        memcpy(dst, buf, avctx->width);
-        dst += s->pic.linesize[0];
-        buf += avctx->width;
+        if(version == 0x100) {
+            int j;
+            for(j = 0; j < avctx->width; j++) {
+                dst[j] = buf[ (i&3)*(avctx->width /4) + (j/4) +
+                             ((j&3)*(avctx->height/4) + (i/4))*avctx->width];
+            }
+        } else {
+            memcpy(dst, buf, avctx->width);
+            buf += avctx->width;
+        }
+        dst += frame->linesize[0];
     }
-    memcpy(s->pic.data[1], s->pal, sizeof(s->pal));
+    memcpy(frame->data[1], s->pal, sizeof(s->pal));
 
     *got_frame = 1;
-    *(AVFrame*)data = s->pic;
 
     return avpkt->size;
 }
@@ -379,9 +409,6 @@ static av_cold int dfa_decode_end(AVCodecContext *avctx)
 {
     DfaContext *s = avctx->priv_data;
 
-    if (s->pic.data[0])
-        avctx->release_buffer(avctx, &s->pic);
-
     av_freep(&s->frame_buf);
 
     return 0;
@@ -389,12 +416,12 @@ static av_cold int dfa_decode_end(AVCodecContext *avctx)
 
 AVCodec ff_dfa_decoder = {
     .name           = "dfa",
+    .long_name      = NULL_IF_CONFIG_SMALL("Chronomaster DFA"),
     .type           = AVMEDIA_TYPE_VIDEO,
     .id             = AV_CODEC_ID_DFA,
     .priv_data_size = sizeof(DfaContext),
     .init           = dfa_decode_init,
     .close          = dfa_decode_end,
     .decode         = dfa_decode_frame,
-    .capabilities   = CODEC_CAP_DR1,
-    .long_name      = NULL_IF_CONFIG_SMALL("Chronomaster DFA"),
+    .capabilities   = AV_CODEC_CAP_DR1,
 };

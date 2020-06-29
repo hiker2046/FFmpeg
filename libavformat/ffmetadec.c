@@ -19,17 +19,60 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/bprint.h"
 #include "libavutil/mathematics.h"
 #include "avformat.h"
 #include "ffmeta.h"
 #include "internal.h"
 #include "libavutil/dict.h"
 
-static int probe(AVProbeData *p)
+static int probe(const AVProbeData *p)
 {
     if(!memcmp(p->buf, ID_STRING, strlen(ID_STRING)))
         return AVPROBE_SCORE_MAX;
     return 0;
+}
+
+static int64_t read_line_to_bprint_escaped(AVIOContext *s, AVBPrint *bp)
+{
+    int len, end;
+    int64_t read = 0;
+    char tmp[1024];
+    char c;
+    char prev = ' ';
+
+    do {
+        len = 0;
+        do {
+            c = avio_r8(s);
+            end = prev != '\\' && (c == '\r' || c == '\n' || c == '\0');
+            if (!end)
+                tmp[len++] = c;
+            prev = c;
+        } while (!end && len < sizeof(tmp));
+        av_bprint_append_data(bp, tmp, len);
+        read += len;
+    } while (!end);
+
+    if (c == '\r' && avio_r8(s) != '\n' && !avio_feof(s))
+        avio_skip(s, -1);
+
+    if (!c && s->error)
+        return s->error;
+
+    if (!c && !read && avio_feof(s))
+        return AVERROR_EOF;
+
+    return read;
+}
+
+static void get_bprint_line(AVIOContext *s, AVBPrint *bp)
+{
+
+    do {
+        av_bprint_clear(bp);
+        read_line_to_bprint_escaped(s, bp);
+    } while (!avio_feof(s) && (bp->str[0] == ';' || bp->str[0] == '#' || bp->str[0] == 0));
 }
 
 static void get_line(AVIOContext *s, uint8_t *buf, int size)
@@ -50,7 +93,7 @@ static void get_line(AVIOContext *s, uint8_t *buf, int size)
                 buf[i++] = c;
         }
         buf[i] = 0;
-    } while (!url_feof(s) && (buf[0] == ';' || buf[0] == '#' || buf[0] == 0));
+    } while (!avio_feof(s) && (buf[0] == ';' || buf[0] == '#' || buf[0] == 0));
 }
 
 static AVChapter *read_chapter(AVFormatContext *s)
@@ -78,10 +121,11 @@ static AVChapter *read_chapter(AVFormatContext *s)
     return avpriv_new_chapter(s, s->nb_chapters, tb, start, end, NULL);
 }
 
-static uint8_t *unescape(uint8_t *buf, int size)
+static uint8_t *unescape(const uint8_t *buf, int size)
 {
     uint8_t *ret = av_malloc(size + 1);
-    uint8_t *p1  = ret, *p2 = buf;
+    uint8_t *p1  = ret;
+    const uint8_t *p2 = buf;
 
     if (!ret)
         return NULL;
@@ -95,9 +139,10 @@ static uint8_t *unescape(uint8_t *buf, int size)
     return ret;
 }
 
-static int read_tag(uint8_t *line, AVDictionary **m)
+static int read_tag(const uint8_t *line, AVDictionary **m)
 {
-    uint8_t *key, *value, *p = line;
+    uint8_t *key, *value;
+    const uint8_t *p = line;
 
     /* find first not escaped '=' */
     while (1) {
@@ -126,31 +171,35 @@ static int read_tag(uint8_t *line, AVDictionary **m)
 static int read_header(AVFormatContext *s)
 {
     AVDictionary **m = &s->metadata;
-    uint8_t line[1024];
+    AVBPrint bp;
 
-    while(!url_feof(s->pb)) {
-        get_line(s->pb, line, sizeof(line));
+    av_bprint_init(&bp, 0, AV_BPRINT_SIZE_UNLIMITED);
 
-        if (!memcmp(line, ID_STREAM, strlen(ID_STREAM))) {
+    while(!avio_feof(s->pb)) {
+        get_bprint_line(s->pb, &bp);
+
+        if (!memcmp(bp.str, ID_STREAM, strlen(ID_STREAM))) {
             AVStream *st = avformat_new_stream(s, NULL);
 
             if (!st)
-                return -1;
+                return AVERROR(ENOMEM);
 
-            st->codec->codec_type = AVMEDIA_TYPE_DATA;
-            st->codec->codec_id   = AV_CODEC_ID_FFMETADATA;
+            st->codecpar->codec_type = AVMEDIA_TYPE_DATA;
+            st->codecpar->codec_id   = AV_CODEC_ID_FFMETADATA;
 
             m = &st->metadata;
-        } else if (!memcmp(line, ID_CHAPTER, strlen(ID_CHAPTER))) {
+        } else if (!memcmp(bp.str, ID_CHAPTER, strlen(ID_CHAPTER))) {
             AVChapter *ch = read_chapter(s);
 
             if (!ch)
-                return -1;
+                return AVERROR(ENOMEM);
 
             m = &ch->metadata;
         } else
-            read_tag(line, m);
+            read_tag(bp.str, m);
     }
+
+    av_bprint_finalize(&bp, NULL);
 
     s->start_time = 0;
     if (s->nb_chapters)

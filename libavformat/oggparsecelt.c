@@ -37,51 +37,51 @@ static int celt_header(AVFormatContext *s, int idx)
     AVStream *st = s->streams[idx];
     struct oggcelt_private *priv = os->private;
     uint8_t *p = os->buf + os->pstart;
+    int ret;
 
     if (os->psize == 60 &&
         !memcmp(p, ff_celt_codec.magic, ff_celt_codec.magicsize)) {
         /* Main header */
 
-        uint32_t version, sample_rate, nb_channels, frame_size;
+        uint32_t version, sample_rate, nb_channels;
         uint32_t overlap, extra_headers;
-        uint8_t *extradata;
 
-        extradata = av_malloc(2 * sizeof(uint32_t) +
-                              FF_INPUT_BUFFER_PADDING_SIZE);
         priv = av_malloc(sizeof(struct oggcelt_private));
-        if (!extradata || !priv) {
-            av_free(extradata);
-            av_free(priv);
+        if (!priv)
             return AVERROR(ENOMEM);
+        ret = ff_alloc_extradata(st->codecpar, 2 * sizeof(uint32_t));
+        if (ret < 0) {
+            av_free(priv);
+            return ret;
         }
         version          = AV_RL32(p + 28);
         /* unused header size field skipped */
         sample_rate      = AV_RL32(p + 36);
         nb_channels      = AV_RL32(p + 40);
-        frame_size       = AV_RL32(p + 44);
         overlap          = AV_RL32(p + 48);
         /* unused bytes per packet field skipped */
         extra_headers    = AV_RL32(p + 56);
-        st->codec->codec_type     = AVMEDIA_TYPE_AUDIO;
-        st->codec->codec_id       = AV_CODEC_ID_CELT;
-        st->codec->sample_rate    = sample_rate;
-        st->codec->channels       = nb_channels;
-        st->codec->frame_size     = frame_size;
-        av_free(st->codec->extradata);
-        st->codec->extradata      = extradata;
-        st->codec->extradata_size = 2 * sizeof(uint32_t);
+        st->codecpar->codec_type     = AVMEDIA_TYPE_AUDIO;
+        st->codecpar->codec_id       = AV_CODEC_ID_CELT;
+        st->codecpar->sample_rate    = sample_rate;
+        st->codecpar->channels       = nb_channels;
         if (sample_rate)
             avpriv_set_pts_info(st, 64, 1, sample_rate);
-        priv->extra_headers_left  = 1 + extra_headers;
-        av_free(os->private);
+
+        if (os->private) {
+            av_free(priv);
+            priv = os->private;
+        }
         os->private = priv;
-        AV_WL32(extradata + 0, overlap);
-        AV_WL32(extradata + 4, version);
+        priv->extra_headers_left  = 1 + extra_headers;
+
+        AV_WL32(st->codecpar->extradata + 0, overlap);
+        AV_WL32(st->codecpar->extradata + 4, version);
         return 1;
     } else if (priv && priv->extra_headers_left) {
         /* Extra headers (vorbiscomment) */
 
-        ff_vorbis_comment(s, &st->metadata, p, os->psize);
+        ff_vorbis_stream_comment(s, st, p, os->psize);
         priv->extra_headers_left--;
         return 1;
     } else {

@@ -24,13 +24,14 @@
  * G.723.1 demuxer
  */
 
+#include "libavutil/attributes.h"
 #include "libavutil/channel_layout.h"
 #include "avformat.h"
 #include "internal.h"
 
 static const uint8_t frame_size[4] = { 24, 20, 4, 1 };
 
-static int g723_1_init(AVFormatContext *s)
+static av_cold int g723_1_init(AVFormatContext *s)
 {
     AVStream *st;
 
@@ -38,13 +39,13 @@ static int g723_1_init(AVFormatContext *s)
     if (!st)
         return AVERROR(ENOMEM);
 
-    st->codec->codec_type     = AVMEDIA_TYPE_AUDIO;
-    st->codec->codec_id       = AV_CODEC_ID_G723_1;
-    st->codec->channel_layout = AV_CH_LAYOUT_MONO;
-    st->codec->channels       = 1;
-    st->codec->sample_rate    = 8000;
+    st->codecpar->codec_type     = AVMEDIA_TYPE_AUDIO;
+    st->codecpar->codec_id       = AV_CODEC_ID_G723_1;
+    st->codecpar->channel_layout = AV_CH_LAYOUT_MONO;
+    st->codecpar->channels       = 1;
+    st->codecpar->sample_rate    = 8000;
 
-    avpriv_set_pts_info(st, 64, 1, st->codec->sample_rate);
+    avpriv_set_pts_info(st, 64, 1, st->codecpar->sample_rate);
     st->start_time = 0;
 
     return 0;
@@ -68,7 +69,6 @@ static int g723_1_read_packet(AVFormatContext *s, AVPacket *pkt)
 
     ret = avio_read(s->pb, pkt->data + 1, size - 1);
     if (ret < size - 1) {
-        av_free_packet(pkt);
         return ret < 0 ? ret : AVERROR_EOF;
     }
 

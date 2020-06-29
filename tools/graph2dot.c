@@ -28,7 +28,7 @@
 #include "libavutil/channel_layout.h"
 #include "libavutil/mem.h"
 #include "libavutil/pixdesc.h"
-#include "libavfilter/avfiltergraph.h"
+#include "libavfilter/avfilter.h"
 
 #if !HAVE_GETOPT
 #include "compat/getopt.c"
@@ -36,7 +36,7 @@
 
 static void usage(void)
 {
-    printf("Convert a libavfilter graph to a dot file\n");
+    printf("Convert a libavfilter graph to a dot file.\n");
     printf("Usage: graph2dot [OPTIONS]\n");
     printf("\n"
            "Options:\n"
@@ -58,7 +58,7 @@ static void print_digraph(FILE *outfile, AVFilterGraph *graph)
     fprintf(outfile, "node [shape=box]\n");
     fprintf(outfile, "rankdir=LR\n");
 
-    for (i = 0; i < graph->filter_count; i++) {
+    for (i = 0; i < graph->nb_filters; i++) {
         char filter_ctx_label[128];
         const AVFilterContext *filter_ctx = graph->filters[i];
 
@@ -66,7 +66,7 @@ static void print_digraph(FILE *outfile, AVFilterGraph *graph)
                  filter_ctx->name,
                  filter_ctx->filter->name);
 
-        for (j = 0; j < filter_ctx->output_count; j++) {
+        for (j = 0; j < filter_ctx->nb_outputs; j++) {
             AVFilterLink *link = filter_ctx->outputs[j];
             if (link) {
                 char dst_filter_ctx_label[128];
@@ -79,7 +79,8 @@ static void print_digraph(FILE *outfile, AVFilterGraph *graph)
 
                 fprintf(outfile, "\"%s\" -> \"%s\" [ label= \"inpad:%s -> outpad:%s\\n",
                         filter_ctx_label, dst_filter_ctx_label,
-                        link->srcpad->name, link->dstpad->name);
+                        avfilter_pad_get_name(link->srcpad, 0),
+                        avfilter_pad_get_name(link->dstpad, 0));
 
                 if (link->type == AVMEDIA_TYPE_VIDEO) {
                     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(link->format);
@@ -137,7 +138,7 @@ int main(int argc, char **argv)
         infilename = "/dev/stdin";
     infile = fopen(infilename, "r");
     if (!infile) {
-        fprintf(stderr, "Impossible to open input file '%s': %s\n",
+        fprintf(stderr, "Failed to open input file '%s': %s\n",
                 infilename, strerror(errno));
         return 1;
     }
@@ -146,20 +147,28 @@ int main(int argc, char **argv)
         outfilename = "/dev/stdout";
     outfile = fopen(outfilename, "w");
     if (!outfile) {
-        fprintf(stderr, "Impossible to open output file '%s': %s\n",
+        fprintf(stderr, "Failed to open output file '%s': %s\n",
                 outfilename, strerror(errno));
         return 1;
     }
 
     /* read from infile and put it in a buffer */
     {
-        unsigned int count = 0;
+        int64_t count = 0;
         struct line *line, *last_line, *first_line;
         char *p;
         last_line = first_line = av_malloc(sizeof(struct line));
+        if (!last_line) {
+            fprintf(stderr, "Memory allocation failure\n");
+            return 1;
+        }
 
         while (fgets(last_line->data, sizeof(last_line->data), infile)) {
             struct line *new_line = av_malloc(sizeof(struct line));
+            if (!new_line) {
+                fprintf(stderr, "Memory allocation failure\n");
+                return 1;
+            }
             count += strlen(last_line->data);
             last_line->next = new_line;
             last_line       = new_line;
@@ -167,19 +176,21 @@ int main(int argc, char **argv)
         last_line->next = NULL;
 
         graph_string = av_malloc(count + 1);
+        if (!graph_string) {
+            fprintf(stderr, "Memory allocation failure\n");
+            return 1;
+        }
         p = graph_string;
         for (line = first_line; line->next; line = line->next) {
-            unsigned int l = strlen(line->data);
+            size_t l = strlen(line->data);
             memcpy(p, line->data, l);
             p += l;
         }
         *p = '\0';
     }
 
-    avfilter_register_all();
-
     if (avfilter_graph_parse(graph, graph_string, NULL, NULL, NULL) < 0) {
-        fprintf(stderr, "Impossible to parse the graph description\n");
+        fprintf(stderr, "Failed to parse the graph description\n");
         return 1;
     }
 

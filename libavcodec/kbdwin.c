@@ -16,9 +16,8 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-
-#include <libavutil/avassert.h>
-#include <libavutil/mathematics.h>
+#include "libavutil/avassert.h"
+#include "libavutil/mathematics.h"
 #include "libavutil/attributes.h"
 #include "kbdwin.h"
 
@@ -45,4 +44,14 @@ av_cold void ff_kbd_window_init(float *window, float alpha, int n)
    sum++;
    for (i = 0; i < n; i++)
        window[i] = sqrt(local_window[i] / sum);
+}
+
+av_cold void ff_kbd_window_init_fixed(int32_t *window, float alpha, int n)
+{
+    int i;
+    float local_window[FF_KBD_WINDOW_MAX];
+
+    ff_kbd_window_init(local_window, alpha, n);
+    for (i = 0; i < n; i++)
+        window[i] = (int)floor(2147483647.0 * local_window[i] + 0.5);
 }
